@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Production build for any Flutter app: bump the version in pubspec.yaml, build store artifacts,
-# commit, tag, optionally upload. Run from inside an app that has a release.config.
+# commit, tag, optionally upload. Run from inside a Flutter app; it reads the name and package from the project.
 #
-#   release.sh                     interactive: asks each question in sequence
-#   release.sh patch|minor|major|build [--ios] [--android] [--upload] [--dry-run] [--no-tag] [--allow-dirty]
+#   release signing <file>         remember the Android signing file (once per machine)
+#   release                        interactive: asks each question in sequence
+#   release patch|minor|major|build [--ios] [--android] [--upload] [--dry-run] [--no-tag] [--allow-dirty]
 #
 #   patch/minor/major  bump the version name and the build number
 #   build              bump only the build number (re-upload after a rejected binary)
@@ -18,27 +19,84 @@ set -euo pipefail
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
-# TOOLS_DIR is this repo (shared Fastfile, credentials); the app is the git repo we are run from.
-TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run this from inside an app repository"
-cd "$ROOT"
+# The Android signing file is machine-level: remembered once in ~/.config/release-tools/config.
+GLOBAL_CONFIG="$HOME/.config/release-tools/config"
 
-PUBSPEC="pubspec.yaml"
-[ -f "$PUBSPEC" ] || die "no $PUBSPEC in $ROOT"
-[ -f release.config ] || die "no release.config in $ROOT (needs APP_NAME and ANDROID_PACKAGE)"
-# shellcheck disable=SC1091
-. ./release.config
-: "${APP_NAME:?release.config must set APP_NAME}"
-: "${ANDROID_PACKAGE:?release.config must set ANDROID_PACKAGE}"
+# Warn when a secrets file can be read by other local users (macOS stat).
+warn_loose() {
+  local mode
+  mode="$(stat -f %Lp "$1" 2>/dev/null || true)"
+  if [ -n "$mode" ] && [ $((mode % 100)) -ne 0 ]; then
+    echo "warning: $1 is readable by other users (mode $mode); run: chmod 600 \"$1\"" >&2
+  fi
+}
 
-# One signing key for every app (see android/app/build.gradle.kts in each app).
-KEYSTORE_PROPERTIES="${KEYSTORE_PROPERTIES:-$HOME/Desktop/ltl/keystore.properties}"
+# Check the signing file has every key Gradle needs, and that the keystore it points to exists.
+check_signing_file() {
+  local key missing=""
+  for key in KEY_ALIAS KEY_PATH KEY_STORE_PASSWORD KEY_PASSWORD; do
+    grep -q "^$key=." "$1" || missing="$missing $key"
+  done
+  [ -z "$missing" ] || die "$1 is missing:$missing"
+  local jks
+  jks="$(sed -n 's/^KEY_PATH=//p' "$1" | head -n 1)"
+  [ -f "$jks" ] || die "KEY_PATH in $1 is not a file: $jks"
+  warn_loose "$1"
+  warn_loose "$jks"
+}
+
+saved_signing_path() { sed -n 's/^KEYSTORE_PROPERTIES=//p' "$GLOBAL_CONFIG" 2>/dev/null | head -n 1 || true; }
+
+save_signing_path() {
+  local p="${1/#\~/$HOME}"
+  [ -f "$p" ] || die "not a file: $p"
+  p="$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+  mkdir -p "$(dirname "$GLOBAL_CONFIG")"
+  printf 'KEYSTORE_PROPERTIES=%s\n' "$p" > "$GLOBAL_CONFIG"
+  KEYSTORE_PROPERTIES="$p"
+}
+
+if [ "${1:-}" = "signing" ]; then
+  save_signing_path "${2:?usage: release signing /path/to/keystore.properties}"
+  echo "signing file saved: $KEYSTORE_PROPERTIES"
+  exit 0
+fi
+
+# TOOLS_DIR is this repo (shared Fastfile, credentials). `release` is usually a symlink, so resolve it.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+done
+TOOLS_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 FASTFILE="$TOOLS_DIR/fastlane/Fastfile"
 
-# flutter lives in fvm on this machine
-command -v flutter >/dev/null || { [ -d "$HOME/fvm/default/bin" ] && export PATH="$HOME/fvm/default/bin:$PATH"; }
+# The app is the git repo we are run from.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run this from inside an app repository"
+cd "$ROOT"
+PUBSPEC="pubspec.yaml"
+[ -f "$PUBSPEC" ] || die "no $PUBSPEC in $ROOT"
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# Read what the project already says; release.config is only an optional override file.
+ENV_SIGNING="${KEYSTORE_PROPERTIES:-}"
+# shellcheck disable=SC1091
+[ ! -f release.config ] || . ./release.config
+: "${APP_NAME:=$(sed -nE 's/^name:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' "$PUBSPEC" | head -n 1)}"
+: "${ANDROID_PACKAGE:=$(sed -nE 's/.*applicationId[[:space:]]*=?[[:space:]]*"([^"]+)".*/\1/p' android/app/build.gradle.kts android/app/build.gradle 2>/dev/null | head -n 1 || true)}"
+[ -n "$APP_NAME" ] || die "cannot read the app name from $PUBSPEC (set APP_NAME in release.config)"
+
+# One signing key for every app. Order: environment, release.config, the remembered path.
+# Exported so each app's Gradle build reads the same file.
+KEYSTORE_PROPERTIES="${ENV_SIGNING:-${KEYSTORE_PROPERTIES:-$(saved_signing_path)}}"
+
+# Find flutter when it is not on PATH (fvm or a plain checkout).
+if ! command -v flutter >/dev/null; then
+  for dir in "$HOME/fvm/default/bin" "$HOME/development/flutter/bin" "$HOME/flutter/bin"; do
+    [ -x "$dir/flutter" ] && { export PATH="$dir:$PATH"; break; }
+  done
+fi
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---- current version --------------------------------------------------------
 CURRENT="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+)[[:space:]]*$/\1/p' "$PUBSPEC")"
@@ -181,7 +239,21 @@ fi
 git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null && die "tag $TAG_NAME already exists"
 command -v flutter >/dev/null || die "flutter not on PATH"
 if [ "$DO_ANDROID" = 1 ]; then
-  [ -f "$KEYSTORE_PROPERTIES" ] || die "Android signing file not found: $KEYSTORE_PROPERTIES"
+  if [ ! -f "${KEYSTORE_PROPERTIES:-}" ]; then
+    if [ "$DRY" = 1 ]; then
+      echo "warning: Android signing file not set; run: release signing /path/to/keystore.properties" >&2
+    else
+      [ -t 0 ] || die "Android signing file not set; run: release signing /path/to/keystore.properties"
+      [ -z "${KEYSTORE_PROPERTIES:-}" ] || echo "signing file not found: $KEYSTORE_PROPERTIES"
+      printf 'Path to your keystore.properties (saved for every app): '
+      read -r answer
+      save_signing_path "$answer"
+    fi
+  fi
+  if [ -f "${KEYSTORE_PROPERTIES:-}" ]; then
+    check_signing_file "$KEYSTORE_PROPERTIES"
+    export KEYSTORE_PROPERTIES
+  fi
 fi
 if [ "$UPLOAD" = 1 ]; then
   command -v fastlane >/dev/null || die "--upload needs fastlane"
