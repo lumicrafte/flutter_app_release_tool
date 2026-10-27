@@ -188,7 +188,7 @@ if [ -z "$MODE" ]; then
     "minor   $(next_version minor)" \
     "major   $(next_version major)" \
     "build   $(next_version build)  (build number only)" \
-    "current $CURRENT  (same version, build another platform)"
+    "current $CURRENT  (current version)"
   MODE="$(echo "patch minor major build current" | cut -d' ' -f$((CHOICE + 1)))"
   # A rebuild of the released version needs no new commit or tag.
   if [ "$MODE" = "current" ]; then TAG=0; SET_TAG=1; fi
