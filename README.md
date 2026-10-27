@@ -66,4 +66,4 @@ release patch --upload       # or pass everything as flags
 release build --android --dry-run
 ```
 
-Bump types: `patch`, `minor`, `major`, `build` (build number only). The build number always increases and never resets. Flags: `--ios`, `--android`, `--upload`, `--dry-run`, `--no-tag`, `--allow-dirty`.
+Bump types: `patch`, `minor`, `major`, `build` (build number only), and `current` (no bump: build another platform of the version you already released, for example `release current --ios` after an Android-only release; it makes no commit or tag and warns if the code has changed since the tag). The build number always increases and never resets. Flags: `--ios`, `--android`, `--upload`, `--dry-run`, `--no-tag`, `--allow-dirty`.

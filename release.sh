@@ -4,10 +4,11 @@
 #
 #   release signing <file>         remember the Android signing file (once per machine)
 #   release                        interactive: asks each question in sequence
-#   release patch|minor|major|build [--ios] [--android] [--upload] [--dry-run] [--no-tag] [--allow-dirty]
+#   release patch|minor|major|build|current [--ios] [--android] [--upload] [--dry-run] [--no-tag] [--allow-dirty]
 #
 #   patch/minor/major  bump the version name and the build number
 #   build              bump only the build number (re-upload after a rejected binary)
+#   current            no bump: build another platform of the version already released
 #   --ios / --android  build one platform (default: both)
 #   --upload           push the artifacts with fastlane (lanes ios_upload / android_upload)
 #   --dry-run          print the next version and the plan, change nothing
@@ -96,7 +97,7 @@ if ! command -v flutter >/dev/null; then
   done
 fi
 
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---- current version --------------------------------------------------------
 CURRENT="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+)[[:space:]]*$/\1/p' "$PUBSPEC")"
@@ -117,7 +118,7 @@ EOF2
     minor) minor=$((minor + 1)); patch=0 ;;
     patch) patch=$((patch + 1)) ;;
   esac
-  echo "$major.$minor.$patch+$((BUILD + 1))"
+  if [ "$1" = "current" ]; then echo "$CURRENT"; else echo "$major.$minor.$patch+$((BUILD + 1))"; fi
 }
 
 # ---- prompts ----------------------------------------------------------------
@@ -166,7 +167,7 @@ SET_PLATFORM=0; SET_UPLOAD=0; SET_TAG=0
 
 for arg in "$@"; do
   case "$arg" in
-    patch|minor|major|build) MODE="$arg" ;;
+    patch|minor|major|build|current) MODE="$arg" ;;
     --ios) DO_IOS=1; SET_PLATFORM=1 ;;
     --android) DO_ANDROID=1; SET_PLATFORM=1 ;;
     --upload) UPLOAD=1; SET_UPLOAD=1 ;;
@@ -186,8 +187,11 @@ if [ -z "$MODE" ]; then
     "patch   $(next_version patch)" \
     "minor   $(next_version minor)" \
     "major   $(next_version major)" \
-    "build   $(next_version build)  (build number only)"
-  MODE="$(echo "patch minor major build" | cut -d' ' -f$((CHOICE + 1)))"
+    "build   $(next_version build)  (build number only)" \
+    "current $CURRENT  (same version, build another platform)"
+  MODE="$(echo "patch minor major build current" | cut -d' ' -f$((CHOICE + 1)))"
+  # A rebuild of the released version needs no new commit or tag.
+  if [ "$MODE" = "current" ]; then TAG=0; SET_TAG=1; fi
 
   if [ "$SET_PLATFORM" = 0 ]; then
     choose "Platforms" 0 "iOS and Android" "iOS only" "Android only"
@@ -219,6 +223,7 @@ if [ -z "$MODE" ]; then
 fi
 
 if [ "$DO_IOS" = 0 ] && [ "$DO_ANDROID" = 0 ]; then DO_IOS=1; DO_ANDROID=1; fi
+[ "$MODE" != "current" ] || TAG=0
 
 NEXT="$(next_version "$MODE")"
 NEXT_NAME="${NEXT%%+*}"
@@ -226,7 +231,7 @@ TAG_NAME="v$NEXT"
 OUT_DIR="build/releases/$NEXT"
 
 # ---- preflight --------------------------------------------------------------
-step "Release $CURRENT -> $NEXT ($MODE)"
+if [ "$MODE" = "current" ]; then step "Rebuild $CURRENT (no version change)"; else step "Release $CURRENT -> $NEXT ($MODE)"; fi
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || echo "warning: on branch '$BRANCH', not main"
@@ -236,7 +241,16 @@ git diff --quiet -- "$PUBSPEC" && git diff --cached --quiet -- "$PUBSPEC" \
 if [ "$DIRTY_OK" = 0 ] && [ -n "$(git status --porcelain)" ]; then
   die "working tree is not clean (commit or stash, or pass --allow-dirty)"
 fi
-git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null && die "tag $TAG_NAME already exists"
+if [ "$MODE" = "current" ]; then
+  if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
+    ahead="$(git rev-list --count "$TAG_NAME..HEAD")"
+    [ "$ahead" = 0 ] || echo "warning: $ahead commit(s) since $TAG_NAME; this build will not match the earlier platform's code" >&2
+  else
+    echo "warning: no tag $TAG_NAME; was $CURRENT released from this code?" >&2
+  fi
+else
+  git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null && die "tag $TAG_NAME already exists"
+fi
 command -v flutter >/dev/null || die "flutter not on PATH"
 if [ "$DO_ANDROID" = 1 ]; then
   if [ ! -f "${KEYSTORE_PROPERTIES:-}" ]; then
@@ -290,8 +304,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-step "Set version $NEXT"
-sed -E -i '' "s/^version:.*/version: $NEXT/" "$PUBSPEC"
+if [ "$MODE" != "current" ]; then
+  step "Set version $NEXT"
+  sed -E -i '' "s/^version:.*/version: $NEXT/" "$PUBSPEC"
+fi
 flutter pub get >/dev/null
 
 mkdir -p "$OUT_DIR"
