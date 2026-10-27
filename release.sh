@@ -214,7 +214,7 @@ if [ -z "$MODE" ]; then
     [ "$CHOICE" = 1 ] && COMMIT=0
   fi
   if [ "$SET_TAG" = 0 ] && [ "$COMMIT" = 1 ]; then
-    choose "Tag the release commit?" 0 "No" "Yes ($TAG_PREFIX/v...)"
+    choose "Tag the release commit?" 0 "No" "Yes ($TAG_PREFIX/v$(next_version "$MODE"))"
     [ "$CHOICE" = 1 ] && TAG=1
   fi
   if [ -n "$(git status --porcelain)" ] && [ "$DIRTY_OK" = 0 ]; then
