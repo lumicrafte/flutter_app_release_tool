@@ -4,7 +4,7 @@
 #
 #   release signing <file>         remember the Android signing file (once per machine)
 #   release                        interactive: asks each question in sequence
-#   release patch|minor|major|build|current [--ios] [--android] [--upload] [--dry-run] [--no-tag] [--allow-dirty]
+#   release patch|minor|major|build|current [--ios] [--android] [--upload] [--dry-run] [--no-commit] [--tag] [--allow-dirty]
 #
 #   patch/minor/major  bump the version name and the build number
 #   build              bump only the build number (re-upload after a rejected binary)
@@ -12,7 +12,8 @@
 #   --ios / --android  build one platform (default: both)
 #   --upload           push the artifacts with fastlane (lanes ios_upload / android_upload)
 #   --dry-run          print the next version and the plan, change nothing
-#   --no-tag           skip the release commit and tag
+#   --no-commit        leave the version bump uncommitted (default: commit pubspec.yaml)
+#   --tag              also tag the release commit as <app>/v<version> (default: no tag)
 #   --allow-dirty      allow unrelated uncommitted changes (only pubspec.yaml is committed)
 
 set -euo pipefail
@@ -84,6 +85,8 @@ ENV_SIGNING="${KEYSTORE_PROPERTIES:-}"
 [ ! -f release.config ] || . ./release.config
 : "${APP_NAME:=$(sed -nE 's/^name:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' "$PUBSPEC" | head -n 1)}"
 : "${ANDROID_PACKAGE:=$(sed -nE 's/.*applicationId[[:space:]]*=?[[:space:]]*"([^"]+)".*/\1/p' android/app/build.gradle.kts android/app/build.gradle 2>/dev/null | head -n 1 || true)}"
+: "${TAG_PREFIX:=${ANDROID_PACKAGE##*.}}"
+: "${TAG_PREFIX:=$APP_NAME}"
 [ -n "$APP_NAME" ] || die "cannot read the app name from $PUBSPEC (set APP_NAME in release.config)"
 
 # One signing key for every app. Order: environment, release.config, the remembered path.
@@ -97,7 +100,7 @@ if ! command -v flutter >/dev/null; then
   done
 fi
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---- current version --------------------------------------------------------
 CURRENT="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+)[[:space:]]*$/\1/p' "$PUBSPEC")"
@@ -162,8 +165,8 @@ choose() {
 # ---- args -------------------------------------------------------------------
 MODE=""
 DO_IOS=0; DO_ANDROID=0
-UPLOAD=0; DRY=0; TAG=1; DIRTY_OK=0
-SET_PLATFORM=0; SET_UPLOAD=0; SET_TAG=0
+UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0
+SET_PLATFORM=0; SET_UPLOAD=0; SET_COMMIT=0; SET_TAG=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -172,7 +175,8 @@ for arg in "$@"; do
     --android) DO_ANDROID=1; SET_PLATFORM=1 ;;
     --upload) UPLOAD=1; SET_UPLOAD=1 ;;
     --dry-run) DRY=1 ;;
-    --no-tag) TAG=0; SET_TAG=1 ;;
+    --no-commit) COMMIT=0; SET_COMMIT=1 ;;
+    --tag) TAG=1; SET_TAG=1 ;;
     --allow-dirty) DIRTY_OK=1 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $arg" >&2; usage 1 ;;
@@ -190,8 +194,8 @@ if [ -z "$MODE" ]; then
     "build   $(next_version build)  (build number only)" \
     "current $CURRENT  (current version)"
   MODE="$(echo "patch minor major build current" | cut -d' ' -f$((CHOICE + 1)))"
-  # A rebuild of the released version needs no new commit or tag.
-  if [ "$MODE" = "current" ]; then TAG=0; SET_TAG=1; fi
+  # A rebuild of the current version changes nothing to commit or tag.
+  if [ "$MODE" = "current" ]; then COMMIT=0; TAG=0; SET_COMMIT=1; SET_TAG=1; fi
 
   if [ "$SET_PLATFORM" = 0 ]; then
     choose "Platforms" 0 "iOS and Android" "iOS only" "Android only"
@@ -205,9 +209,13 @@ if [ -z "$MODE" ]; then
     choose "Upload to the stores after building?" 1 "Yes (TestFlight / Play $(grep -s '^PLAY_TRACK=' "$TOOLS_DIR/fastlane/.env" | cut -d= -f2- | grep . || echo internal))" "No, build only"
     [ "$CHOICE" = 0 ] && UPLOAD=1
   fi
-  if [ "$SET_TAG" = 0 ]; then
-    choose "Commit and tag the release?" 0 "Yes" "No"
-    [ "$CHOICE" = 1 ] && TAG=0
+  if [ "$SET_COMMIT" = 0 ]; then
+    choose "Commit the version bump?" 0 "Yes" "No"
+    [ "$CHOICE" = 1 ] && COMMIT=0
+  fi
+  if [ "$SET_TAG" = 0 ] && [ "$COMMIT" = 1 ]; then
+    choose "Tag the release commit?" 0 "No" "Yes ($TAG_PREFIX/v...)"
+    [ "$CHOICE" = 1 ] && TAG=1
   fi
   if [ -n "$(git status --porcelain)" ] && [ "$DIRTY_OK" = 0 ]; then
     choose "Working tree has uncommitted changes. Continue anyway?" 1 "No, stop" "Yes, release with them left out"
@@ -223,11 +231,12 @@ if [ -z "$MODE" ]; then
 fi
 
 if [ "$DO_IOS" = 0 ] && [ "$DO_ANDROID" = 0 ]; then DO_IOS=1; DO_ANDROID=1; fi
-[ "$MODE" != "current" ] || TAG=0
+if [ "$MODE" = "current" ]; then COMMIT=0; TAG=0; fi
+[ "$TAG" = 0 ] || [ "$COMMIT" = 1 ] || die "--tag needs the release commit (drop --no-commit)"
 
 NEXT="$(next_version "$MODE")"
 NEXT_NAME="${NEXT%%+*}"
-TAG_NAME="v$NEXT"
+TAG_NAME="$TAG_PREFIX/v$NEXT"
 OUT_DIR="build/releases/$NEXT"
 
 # ---- preflight --------------------------------------------------------------
@@ -241,15 +250,8 @@ git diff --quiet -- "$PUBSPEC" && git diff --cached --quiet -- "$PUBSPEC" \
 if [ "$DIRTY_OK" = 0 ] && [ -n "$(git status --porcelain)" ]; then
   die "working tree is not clean (commit or stash, or pass --allow-dirty)"
 fi
-if [ "$MODE" = "current" ]; then
-  if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
-    ahead="$(git rev-list --count "$TAG_NAME..HEAD")"
-    [ "$ahead" = 0 ] || echo "warning: $ahead commit(s) since $TAG_NAME; this build will not match the earlier platform's code" >&2
-  else
-    echo "warning: no tag $TAG_NAME; was $CURRENT released from this code?" >&2
-  fi
-else
-  git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null && die "tag $TAG_NAME already exists"
+if [ "$TAG" = 1 ] && git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
+  die "tag $TAG_NAME already exists"
 fi
 command -v flutter >/dev/null || die "flutter not on PATH"
 if [ "$DO_ANDROID" = 1 ]; then
@@ -277,7 +279,7 @@ fi
 PLATFORMS=""
 [ "$DO_IOS" = 1 ] && PLATFORMS="$PLATFORMS ios"
 [ "$DO_ANDROID" = 1 ] && PLATFORMS="$PLATFORMS android"
-echo "platforms:$PLATFORMS | upload: $UPLOAD | commit+tag: $TAG | artifacts: $OUT_DIR"
+echo "platforms:$PLATFORMS | upload: $UPLOAD | commit: $COMMIT | tag: $TAG | artifacts: $OUT_DIR"
 
 if [ "$DRY" = 1 ]; then
   echo; echo "dry run, nothing changed."
@@ -334,11 +336,14 @@ if [ "$DO_ANDROID" = 1 ]; then
 fi
 
 # ---- commit + tag -----------------------------------------------------------
-if [ "$TAG" = 1 ]; then
-  step "Commit and tag $TAG_NAME"
+if [ "$COMMIT" = 1 ]; then
+  step "Commit $NEXT"
   git add "$PUBSPEC"
-  git commit -m "release: $NEXT" -- "$PUBSPEC"
-  git tag "$TAG_NAME"
+  git commit -m "release: $APP_NAME $NEXT" -- "$PUBSPEC"
+  if [ "$TAG" = 1 ]; then
+    git tag "$TAG_NAME"
+    echo "tagged $TAG_NAME"
+  fi
 fi
 COMMITTED=1
 
@@ -360,5 +365,5 @@ fi
 step "Done: $NEXT"
 [ -n "$IPA" ] && echo "ipa: $IPA"
 [ -n "$AAB" ] && echo "aab: $AAB"
-[ "$TAG" = 1 ] && echo "push when ready: git push --follow-tags"
+[ "$COMMIT" = 1 ] && echo "push when ready: git push --follow-tags"
 exit 0
