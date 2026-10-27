@@ -84,4 +84,12 @@ The newest builds (by build number) are kept, and the version currently in `pubs
 
 ## Help
 
-`release help` (or `-h`, `--help`) lists every command, option and example, and works from any folder. The text lives in `print_help` in `release.sh`; `tests/help.sh` fails when the script accepts a flag, bump or command the help does not mention, so run it after changing either.
+`release help` (or `-h`, `--help`) lists every command, option and example, and works from any folder. The text lives in `print_help` in `release.sh`; when you add or change a flag, bump or command, update it there by hand.
+
+## Update
+
+```
+release update      # alias: release upgrade
+```
+
+Fast-forwards the install to the latest commit and lists what changed. It works from any folder and only pulls: it does not redo the installer's other steps (the `release` link, the PATH entry, creating `fastlane/.env`). To redo those, re-run the install one-liner. It stops with a message if the install has local changes or has diverged from the remote.

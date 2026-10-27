@@ -16,6 +16,7 @@ USAGE
   release <bump> [options]         run without questions
   release clean [options]          delete old builds
   release signing <file>           remember the Android signing file
+  release update                   install the latest release-tools (alias: upgrade)
   release help                     show this help
 
 BUMPS
@@ -115,6 +116,29 @@ while [ -L "$SELF" ]; do
 done
 TOOLS_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 FASTFILE="$TOOLS_DIR/fastlane/Fastfile"
+
+# `release update`: fast-forward the install to the latest commit. Runs from anywhere, not only inside an app.
+# The whole command sits in one function and the script exits right after it, because bash reads this
+# file as it runs and the update replaces the file.
+update_tools() {
+  [ -d "$TOOLS_DIR/.git" ] || die "$TOOLS_DIR is not a git checkout; re-run the install command from the README"
+  command -v git >/dev/null || die "git is required"
+  local before after branch
+  before="$(git -C "$TOOLS_DIR" rev-parse HEAD)"
+  branch="$(git -C "$TOOLS_DIR" rev-parse --abbrev-ref HEAD)"
+  echo "Updating $TOOLS_DIR ($branch)"
+  git -C "$TOOLS_DIR" pull --ff-only --quiet \
+    || die "could not update; check the network, and local changes or a diverged branch: git -C $TOOLS_DIR status"
+  after="$(git -C "$TOOLS_DIR" rev-parse HEAD)"
+  chmod +x "$TOOLS_DIR/release.sh"
+  if [ "$before" = "$after" ]; then
+    echo "already up to date ($(git -C "$TOOLS_DIR" rev-parse --short HEAD))"
+  else
+    echo "updated $(git -C "$TOOLS_DIR" rev-parse --short "$before") -> $(git -C "$TOOLS_DIR" rev-parse --short "$after"):"
+    git -C "$TOOLS_DIR" log --format='  %s' "$before..$after"
+  fi
+}
+case "${1:-}" in update | upgrade) update_tools; exit 0 ;; esac
 
 # The app is the git repo we are run from.
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run this from inside an app repository"
