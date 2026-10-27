@@ -1,25 +1,68 @@
 #!/usr/bin/env bash
-# Production build for any Flutter app: bump the version in pubspec.yaml, build store artifacts,
-# commit, tag, optionally upload. Run from inside a Flutter app; it reads the name and package from the project.
-#
-#   release signing <file>         remember the Android signing file (once per machine)
-#   release                        interactive: asks each question in sequence
-#   release patch|minor|major|build|current [--ios] [--android] [--upload] [--dry-run] [--no-commit] [--tag] [--allow-dirty]
-#
-#   patch/minor/major  bump the version name and the build number
-#   build              bump only the build number (re-upload after a rejected binary)
-#   current            no bump: build another platform of the version already released
-#   --ios / --android  build one platform (default: both)
-#   --upload           push the artifacts with fastlane (lanes ios_upload / android_upload)
-#   --dry-run          print the next version and the plan, change nothing
-#   --no-commit        leave the version bump uncommitted (default: commit pubspec.yaml)
-#   --tag              also tag the release commit as <app>/v<version> (default: no tag)
-#   --allow-dirty      allow unrelated uncommitted changes (only pubspec.yaml is committed)
+# Production builds for Flutter apps: bump the version, build the IPA and AAB, commit, upload.
+# Run `release help` for usage. The help text lives in print_help below; keep it in sync with the code.
 
 set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
+
+print_help() {
+  cat <<'HELP'
+release: build and ship a Flutter app to TestFlight and Google Play
+
+USAGE
+  release                          ask each question in turn
+  release <bump> [options]         run without questions
+  release clean [options]          delete old builds
+  release signing <file>           remember the Android signing file
+  release help                     show this help
+
+BUMPS
+  patch | minor | major    raise the version name and the build number
+  build                    raise only the build number (after a rejected binary)
+  current                  no bump: build another platform of the current version
+  upload                   no build: upload what is already built for the current version
+
+OPTIONS (builds and uploads)
+  --ios, --android         one platform only (default: both; for `upload`, whatever was built)
+  --upload                 upload to TestFlight / Play after building
+  --dry-run                show the plan and change nothing
+  --no-commit              leave the version bump uncommitted (default: commit pubspec.yaml)
+  --tag                    tag the release commit as <app>/v<version> (default: no tag)
+  --allow-dirty            allow unrelated uncommitted changes (only pubspec.yaml is committed)
+
+CLEAN OPTIONS
+  --keep N                 builds to keep, newest first (default: 3; the current version always stays)
+  --dry-run                list what would be deleted
+  --yes, -y                do not ask first
+
+EXAMPLES
+  release                              interactive release
+  release patch --upload               patch release, upload both platforms
+  release minor --android --tag        Android-only minor release, tagged
+  release current --ios --upload       build and upload iOS for the version already released
+  release upload                       retry an upload without rebuilding
+  release clean --dry-run              see what old builds would be removed
+
+FILES
+  pubspec.yaml                         the version lives here (X.Y.Z+N); the app name comes from it
+  android/app/build.gradle.kts         the Android package is read from applicationId
+  release.config                       optional per-app overrides as KEY=value lines (read, not run):
+                                       APP_NAME, ANDROID_PACKAGE, TAG_PREFIX, KEYSTORE_PROPERTIES
+  ~/.config/release-tools/config       the signing file path, set once by `release signing`
+  <install>/fastlane/.env              App Store Connect and Play credentials (see .env.example)
+  build/releases/<version>/            the IPA and AAB of each release
+HELP
+}
+
+# Help goes to stdout when asked for, to stderr when it follows an error.
+usage() {
+  if [ "${1:-0}" = 0 ]; then print_help; else print_help >&2; fi
+  exit "${1:-0}"
+}
+case " ${1:-} " in " help " | " -h " | " --help ") usage 0 ;; esac
+case " $* " in *" -h "* | *" --help "*) usage 0 ;; esac
 
 # The Android signing file is machine-level: remembered once in ~/.config/release-tools/config.
 GLOBAL_CONFIG="$HOME/.config/release-tools/config"
@@ -79,10 +122,19 @@ cd "$ROOT"
 PUBSPEC="pubspec.yaml"
 [ -f "$PUBSPEC" ] || die "no $PUBSPEC in $ROOT"
 
-# Read what the project already says; release.config is only an optional override file.
+# release.config holds plain KEY=value lines. It is read, never executed, so a repo cannot run code through it.
+config_value() {
+  [ -f release.config ] || return 0
+  sed -n "s/^$1=//p" release.config | head -n 1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" -e "s|^~|$HOME|" -e "s|^\\\$HOME|$HOME|"
+}
+
+# Read what the project already says; release.config only overrides.
 ENV_SIGNING="${KEYSTORE_PROPERTIES:-}"
-# shellcheck disable=SC1091
-[ ! -f release.config ] || . ./release.config
+APP_NAME="$(config_value APP_NAME)"
+ANDROID_PACKAGE="$(config_value ANDROID_PACKAGE)"
+TAG_PREFIX="$(config_value TAG_PREFIX)"
+CONFIG_SIGNING="$(config_value KEYSTORE_PROPERTIES)"
 : "${APP_NAME:=$(sed -nE 's/^name:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' "$PUBSPEC" | head -n 1)}"
 : "${ANDROID_PACKAGE:=$(sed -nE 's/.*applicationId[[:space:]]*=?[[:space:]]*"([^"]+)".*/\1/p' android/app/build.gradle.kts android/app/build.gradle 2>/dev/null | head -n 1 || true)}"
 : "${TAG_PREFIX:=${ANDROID_PACKAGE##*.}}"
@@ -91,7 +143,7 @@ ENV_SIGNING="${KEYSTORE_PROPERTIES:-}"
 
 # One signing key for every app. Order: environment, release.config, the remembered path.
 # Exported so each app's Gradle build reads the same file.
-KEYSTORE_PROPERTIES="${ENV_SIGNING:-${KEYSTORE_PROPERTIES:-$(saved_signing_path)}}"
+KEYSTORE_PROPERTIES="${ENV_SIGNING:-${CONFIG_SIGNING:-$(saved_signing_path)}}"
 
 # Find flutter when it is not on PATH (fvm or a plain checkout).
 if ! command -v flutter >/dev/null; then
@@ -99,8 +151,6 @@ if ! command -v flutter >/dev/null; then
     [ -x "$dir/flutter" ] && { export PATH="$dir:$PATH"; break; }
   done
 fi
-
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---- current version --------------------------------------------------------
 CURRENT="$(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+)[[:space:]]*$/\1/p' "$PUBSPEC")"
@@ -121,7 +171,7 @@ EOF2
     minor) minor=$((minor + 1)); patch=0 ;;
     patch) patch=$((patch + 1)) ;;
   esac
-  if [ "$1" = "current" ]; then echo "$CURRENT"; else echo "$major.$minor.$patch+$((BUILD + 1))"; fi
+  if [ "$1" = "current" ] || [ "$1" = "upload" ]; then echo "$CURRENT"; else echo "$major.$minor.$patch+$((BUILD + 1))"; fi
 }
 
 # ---- prompts ----------------------------------------------------------------
@@ -162,6 +212,57 @@ choose() {
   CHOICE=$sel
 }
 
+# ---- clean ------------------------------------------------------------------
+# Removes old build/releases/<version>/ folders, newest build numbers kept. The version in
+# pubspec.yaml is never removed, because `release current` and `release upload` use it.
+if [ "${1:-}" = "clean" ]; then
+  shift
+  KEEP=3; ASSUME_YES=0; CLEAN_DRY=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep) KEEP="${2:?--keep needs a number}"; shift ;;
+      --yes|-y) ASSUME_YES=1 ;;
+      --dry-run) CLEAN_DRY=1 ;;
+      *) die "unknown clean option: $1" ;;
+    esac
+    shift
+  done
+  case "$KEEP" in ''|*[!0-9]*) die "--keep must be a number" ;; esac
+
+  REL_DIR="$ROOT/build/releases"
+  [ -d "$REL_DIR" ] || { echo "nothing to clean: $REL_DIR does not exist"; exit 0; }
+
+  # Newest first by build number (the part after +), which only ever grows.
+  victims=(); seen=0; total_kb=0
+  while IFS= read -r name; do
+    seen=$((seen + 1))
+    [ "$seen" -gt "$KEEP" ] || continue
+    [ "$name" != "$CURRENT" ] || continue
+    victims[${#victims[@]}]="$name"
+  done < <(ls -1 "$REL_DIR" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+$' | sort -t+ -k2 -n -r)
+
+  if [ "${#victims[@]}" -eq 0 ]; then
+    echo "nothing to clean (keeping $KEEP, plus the current version $CURRENT)"
+    exit 0
+  fi
+  for name in "${victims[@]}"; do
+    kb="$(du -sk "$REL_DIR/$name" | cut -f1)"
+    total_kb=$((total_kb + kb))
+    printf '  %-14s %s\n' "$name" "$(du -sh "$REL_DIR/$name" | cut -f1)"
+  done
+  echo "$((${#victims[@]})) release(s), $((total_kb / 1024)) MB, in $REL_DIR"
+  [ "$CLEAN_DRY" = 0 ] || { echo "dry run, nothing deleted."; exit 0; }
+
+  if [ "$ASSUME_YES" = 0 ]; then
+    [ -t 0 ] || die "not a terminal; pass --yes to delete"
+    choose "Delete these ${#victims[@]} release(s)?" 0 "No, keep them" "Yes, delete"
+    [ "$CHOICE" = 1 ] || exit 1
+  fi
+  for name in "${victims[@]}"; do rm -rf "${REL_DIR:?}/$name"; done
+  echo "deleted ${#victims[@]} release(s)."
+  exit 0
+fi
+
 # ---- args -------------------------------------------------------------------
 MODE=""
 DO_IOS=0; DO_ANDROID=0
@@ -170,7 +271,7 @@ SET_PLATFORM=0; SET_UPLOAD=0; SET_COMMIT=0; SET_TAG=0
 
 for arg in "$@"; do
   case "$arg" in
-    patch|minor|major|build|current) MODE="$arg" ;;
+    patch|minor|major|build|current|upload) MODE="$arg" ;;
     --ios) DO_IOS=1; SET_PLATFORM=1 ;;
     --android) DO_ANDROID=1; SET_PLATFORM=1 ;;
     --upload) UPLOAD=1; SET_UPLOAD=1 ;;
@@ -192,17 +293,19 @@ if [ -z "$MODE" ]; then
     "minor   $(next_version minor)" \
     "major   $(next_version major)" \
     "build   $(next_version build)  (build number only)" \
-    "current $CURRENT  (current version)"
-  MODE="$(echo "patch minor major build current" | cut -d' ' -f$((CHOICE + 1)))"
-  # A rebuild of the current version changes nothing to commit or tag.
-  if [ "$MODE" = "current" ]; then COMMIT=0; TAG=0; SET_COMMIT=1; SET_TAG=1; fi
+    "current $CURRENT  (current version)" \
+    "upload  $CURRENT  (upload the existing build, no rebuild)"
+  MODE="$(echo "patch minor major build current upload" | cut -d' ' -f$((CHOICE + 1)))"
+  # Rebuilding or uploading the current version changes nothing to commit or tag.
+  if [ "$MODE" = "current" ] || [ "$MODE" = "upload" ]; then COMMIT=0; TAG=0; SET_COMMIT=1; SET_TAG=1; fi
+  if [ "$MODE" = "upload" ]; then UPLOAD=1; SET_UPLOAD=1; fi
 
   if [ "$SET_PLATFORM" = 0 ]; then
     choose "Platforms" 0 "iOS and Android" "iOS only" "Android only"
     case "$CHOICE" in
       0) DO_IOS=1; DO_ANDROID=1 ;;
-      1) DO_IOS=1 ;;
-      2) DO_ANDROID=1 ;;
+      1) DO_IOS=1; SET_PLATFORM=1 ;;
+      2) DO_ANDROID=1; SET_PLATFORM=1 ;;
     esac
   fi
   if [ "$SET_UPLOAD" = 0 ]; then
@@ -217,7 +320,7 @@ if [ -z "$MODE" ]; then
     choose "Tag the release commit?" 0 "No" "Yes ($TAG_PREFIX/v$(next_version "$MODE"))"
     [ "$CHOICE" = 1 ] && TAG=1
   fi
-  if [ -n "$(git status --porcelain)" ] && [ "$DIRTY_OK" = 0 ]; then
+  if [ "$MODE" != "upload" ] && [ -n "$(git status --porcelain)" ] && [ "$DIRTY_OK" = 0 ]; then
     choose "Working tree has uncommitted changes. Continue anyway?" 1 "No, stop" "Yes, release with them left out"
     [ "$CHOICE" = 0 ] && exit 1
     DIRTY_OK=1
@@ -231,7 +334,8 @@ if [ -z "$MODE" ]; then
 fi
 
 if [ "$DO_IOS" = 0 ] && [ "$DO_ANDROID" = 0 ]; then DO_IOS=1; DO_ANDROID=1; fi
-if [ "$MODE" = "current" ]; then COMMIT=0; TAG=0; fi
+if [ "$MODE" = "current" ] || [ "$MODE" = "upload" ]; then COMMIT=0; TAG=0; fi
+[ "$MODE" != "upload" ] || UPLOAD=1
 [ "$TAG" = 0 ] || [ "$COMMIT" = 1 ] || die "--tag needs the release commit (drop --no-commit)"
 
 NEXT="$(next_version "$MODE")"
@@ -240,21 +344,25 @@ TAG_NAME="$TAG_PREFIX/v$NEXT"
 OUT_DIR="build/releases/$NEXT"
 
 # ---- preflight --------------------------------------------------------------
-if [ "$MODE" = "current" ]; then step "Rebuild $CURRENT (no version change)"; else step "Release $CURRENT -> $NEXT ($MODE)"; fi
+if [ "$MODE" = "upload" ]; then step "Upload $CURRENT (no rebuild)"
+elif [ "$MODE" = "current" ]; then step "Rebuild $CURRENT (no version change)"; else step "Release $CURRENT -> $NEXT ($MODE)"; fi
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || echo "warning: on branch '$BRANCH', not main"
 
-git diff --quiet -- "$PUBSPEC" && git diff --cached --quiet -- "$PUBSPEC" \
-  || die "$PUBSPEC has uncommitted changes"
-if [ "$DIRTY_OK" = 0 ] && [ -n "$(git status --porcelain)" ]; then
-  die "working tree is not clean (commit or stash, or pass --allow-dirty)"
+# Uploading builds nothing and commits nothing, so the state of the tree does not matter for it.
+if [ "$MODE" != "upload" ]; then
+  git diff --quiet -- "$PUBSPEC" && git diff --cached --quiet -- "$PUBSPEC" \
+    || die "$PUBSPEC has uncommitted changes"
+  if [ "$DIRTY_OK" = 0 ] && [ -n "$(git status --porcelain)" ]; then
+    die "working tree is not clean (commit or stash, or pass --allow-dirty)"
+  fi
 fi
 if [ "$TAG" = 1 ] && git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
   die "tag $TAG_NAME already exists"
 fi
-command -v flutter >/dev/null || die "flutter not on PATH"
-if [ "$DO_ANDROID" = 1 ]; then
+[ "$MODE" = "upload" ] || command -v flutter >/dev/null || die "flutter not on PATH"
+if [ "$DO_ANDROID" = 1 ] && [ "$MODE" != "upload" ]; then
   if [ ! -f "${KEYSTORE_PROPERTIES:-}" ]; then
     if [ "$DRY" = 1 ]; then
       echo "warning: Android signing file not set; run: release signing /path/to/keystore.properties" >&2
@@ -276,63 +384,84 @@ if [ "$UPLOAD" = 1 ]; then
   [ -f "$FASTFILE" ] || die "--upload needs $FASTFILE"
 fi
 
+IPA=""; AAB=""
+if [ "$MODE" = "upload" ]; then
+  # Without --ios/--android, upload whichever platforms were built for this version.
+  if [ "$DO_IOS" = 1 ]; then
+    IPA="$(ls -t "$ROOT/$OUT_DIR"/*.ipa 2>/dev/null | head -n 1 || true)"
+    [ -n "$IPA" ] || [ "$SET_PLATFORM" = 0 ] || die "no .ipa in $OUT_DIR (build it first: release current --ios)"
+  fi
+  if [ "$DO_ANDROID" = 1 ]; then
+    AAB="$ROOT/$OUT_DIR/$APP_NAME-$NEXT.aab"
+    if [ ! -f "$AAB" ]; then
+      [ "$SET_PLATFORM" = 0 ] || die "no .aab at $AAB (build it first: release current --android)"
+      AAB=""
+    fi
+  fi
+  [ -n "$IPA$AAB" ] || die "nothing to upload in $OUT_DIR for $CURRENT"
+fi
+
 PLATFORMS=""
 [ "$DO_IOS" = 1 ] && PLATFORMS="$PLATFORMS ios"
 [ "$DO_ANDROID" = 1 ] && PLATFORMS="$PLATFORMS android"
 echo "platforms:$PLATFORMS | upload: $UPLOAD | commit: $COMMIT | tag: $TAG | artifacts: $OUT_DIR"
 
 if [ "$DRY" = 1 ]; then
+  [ -z "$IPA" ] || echo "would upload: $IPA"
+  [ -z "$AAB" ] || echo "would upload: $AAB"
   echo; echo "dry run, nothing changed."
   exit 0
 fi
 
-# ---- quality gate -----------------------------------------------------------
-step "flutter analyze"
-flutter analyze
-step "flutter test"
-flutter test
+if [ "$MODE" != "upload" ]; then
+  # ---- quality gate -----------------------------------------------------------
+  step "flutter analyze"
+  flutter analyze
+  step "flutter test"
+  flutter test
 
-# ---- bump (restored if anything below fails before the commit) --------------
-BACKUP="$(mktemp)"
-cp "$PUBSPEC" "$BACKUP"
-COMMITTED=0
-cleanup() {
-  status=$?
-  if [ "$status" -ne 0 ] && [ "$COMMITTED" = 0 ]; then
-    cp "$BACKUP" "$PUBSPEC"
-    echo "build failed, $PUBSPEC restored to $CURRENT" >&2
+  # ---- bump (restored if anything below fails before the commit) --------------
+  BACKUP="$(mktemp)"
+  cp "$PUBSPEC" "$BACKUP"
+  COMMITTED=0
+  cleanup() {
+    status=$?
+    if [ "$status" -ne 0 ] && [ "$COMMITTED" = 0 ]; then
+      cp "$BACKUP" "$PUBSPEC"
+      echo "build failed, $PUBSPEC restored to $CURRENT" >&2
+    fi
+    rm -f "$BACKUP"
+  }
+  trap cleanup EXIT
+
+  if [ "$MODE" != "current" ]; then
+    step "Set version $NEXT"
+    sed -E -i '' "s/^version:.*/version: $NEXT/" "$PUBSPEC"
   fi
-  rm -f "$BACKUP"
-}
-trap cleanup EXIT
+  flutter pub get >/dev/null
 
-if [ "$MODE" != "current" ]; then
-  step "Set version $NEXT"
-  sed -E -i '' "s/^version:.*/version: $NEXT/" "$PUBSPEC"
-fi
-flutter pub get >/dev/null
+  mkdir -p "$OUT_DIR"
 
-mkdir -p "$OUT_DIR"
+  # ---- build ------------------------------------------------------------------
 
-# ---- build ------------------------------------------------------------------
-IPA=""; AAB=""
+  if [ "$DO_IOS" = 1 ]; then
+    step "Build iOS (ipa)"
+    flutter build ipa --release
+    IPA="$(ls -t build/ios/ipa/*.ipa 2>/dev/null | head -n 1 || true)"
+    [ -n "$IPA" ] || die "no .ipa produced in build/ios/ipa"
+    cp "$IPA" "$OUT_DIR/"
+    IPA="$ROOT/$OUT_DIR/$(basename "$IPA")"
+  fi
 
-if [ "$DO_IOS" = 1 ]; then
-  step "Build iOS (ipa)"
-  flutter build ipa --release
-  IPA="$(ls -t build/ios/ipa/*.ipa 2>/dev/null | head -n 1 || true)"
-  [ -n "$IPA" ] || die "no .ipa produced in build/ios/ipa"
-  cp "$IPA" "$OUT_DIR/"
-  IPA="$ROOT/$OUT_DIR/$(basename "$IPA")"
-fi
+  if [ "$DO_ANDROID" = 1 ]; then
+    step "Build Android (aab)"
+    flutter build appbundle --release
+    AAB="build/app/outputs/bundle/release/app-release.aab"
+    [ -f "$AAB" ] || die "no .aab produced at $AAB"
+    cp "$AAB" "$OUT_DIR/$APP_NAME-$NEXT.aab"
+    AAB="$ROOT/$OUT_DIR/$APP_NAME-$NEXT.aab"
+  fi
 
-if [ "$DO_ANDROID" = 1 ]; then
-  step "Build Android (aab)"
-  flutter build appbundle --release
-  AAB="build/app/outputs/bundle/release/app-release.aab"
-  [ -f "$AAB" ] || die "no .aab produced at $AAB"
-  cp "$AAB" "$OUT_DIR/$APP_NAME-$NEXT.aab"
-  AAB="$ROOT/$OUT_DIR/$APP_NAME-$NEXT.aab"
 fi
 
 # ---- commit + tag -----------------------------------------------------------
@@ -348,16 +477,22 @@ fi
 COMMITTED=1
 
 # ---- upload -----------------------------------------------------------------
+# fastlane reads fastlane/Fastfile and fastlane/.env from the directory it runs in, so run it in this repo.
+run_lane() {
+  (cd "$TOOLS_DIR" && FASTLANE_SKIP_UPDATE_CHECK=1 FASTLANE_HIDE_CHANGELOG=1 FASTLANE_SKIP_DOCS=1 fastlane "$@")
+}
+
+UPLOAD_FAILED=0
 if [ "$UPLOAD" = 1 ]; then
   if [ -n "$IPA" ]; then
     step "Upload iOS to TestFlight"
-    IPA_PATH="$IPA" fastlane --fastfile "$FASTFILE" ios_upload \
-      || echo "iOS upload failed; retry: IPA_PATH=$IPA fastlane --fastfile $FASTFILE ios_upload" >&2
+    IPA_PATH="$IPA" run_lane ios_upload \
+      || { UPLOAD_FAILED=1; echo "iOS upload failed; retry: release upload --ios" >&2; }
   fi
   if [ -n "$AAB" ]; then
     step "Upload Android to Play"
-    AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" fastlane --fastfile "$FASTFILE" android_upload \
-      || echo "Android upload failed; retry: AAB_PATH=$AAB ANDROID_PACKAGE=$ANDROID_PACKAGE fastlane --fastfile $FASTFILE android_upload" >&2
+    AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" run_lane android_upload \
+      || { UPLOAD_FAILED=1; echo "Android upload failed; retry: release upload --android" >&2; }
   fi
 fi
 
@@ -366,4 +501,4 @@ step "Done: $NEXT"
 [ -n "$IPA" ] && echo "ipa: $IPA"
 [ -n "$AAB" ] && echo "aab: $AAB"
 [ "$COMMIT" = 1 ] && echo "push when ready: git push --follow-tags"
-exit 0
+exit "$UPLOAD_FAILED"

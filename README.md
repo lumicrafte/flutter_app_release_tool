@@ -28,7 +28,7 @@ Run the same line again to update. It installs to `~/.release-tools` and links `
 
 ## Per app
 
-Nothing to configure: the app name comes from `pubspec.yaml` and the Android package from `applicationId`. An optional `release.config` in the app root can override `APP_NAME`, `ANDROID_PACKAGE` or `KEYSTORE_PROPERTIES`; the `KEYSTORE_PROPERTIES` environment variable overrides all of them.
+Nothing to configure: the app name comes from `pubspec.yaml` and the Android package from `applicationId`. An optional `release.config` in the app root can override `APP_NAME`, `ANDROID_PACKAGE`, `TAG_PREFIX` or `KEYSTORE_PROPERTIES`. It holds plain `KEY=value` lines (quotes, `~` and `$HOME` are understood) and is read, never executed; the `KEYSTORE_PROPERTIES` environment variable overrides all of them.
 
 Make the app's `android/app/build.gradle.kts` read the shared signing file:
 
@@ -66,6 +66,22 @@ release patch --upload       # or pass everything as flags
 release build --android --dry-run
 ```
 
-Bump types: `patch`, `minor`, `major`, `build` (build number only), and `current` (no bump: build another platform of the version in `pubspec.yaml`, for example `release current --ios` after an Android-only release; it changes and commits nothing).
+Bump types: `patch`, `minor`, `major`, `build` (build number only), `upload` (no build: sends the artifacts already built for the current version, for example to retry a failed upload; with no `--ios`/`--android` it uploads whichever were built), and `current` (no bump: build another platform of the version in `pubspec.yaml`, for example `release current --ios` after an Android-only release; it changes and commits nothing).
 
 The version bump is committed as `release: <app> <version>`; pass `--no-commit` to leave it uncommitted. Tagging is optional: `--tag` also tags the commit as `<app>/v<version>` (the app is the last part of the Android package, so several apps in one repo never collide). Other flags: `--ios`, `--android`, `--upload`, `--dry-run`, `--allow-dirty`.
+
+## Clean up old builds
+
+Every release leaves its IPA and AAB in `build/releases/<version>/`, about 130 MB each. Remove the old ones:
+
+```
+release clean --dry-run      # list what would go, delete nothing
+release clean                # keep the newest 3, ask before deleting the rest
+release clean --keep 1 --yes # no prompt
+```
+
+The newest builds (by build number) are kept, and the version currently in `pubspec.yaml` is never removed.
+
+## Help
+
+`release help` (or `-h`, `--help`) lists every command, option and example, and works from any folder. The text lives in `print_help` in `release.sh`; `tests/help.sh` fails when the script accepts a flag, bump or command the help does not mention, so run it after changing either.

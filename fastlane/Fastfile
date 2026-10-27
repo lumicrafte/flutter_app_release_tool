@@ -3,13 +3,27 @@
 
 default_platform(:ios)
 
+# A setting from the environment, with a plain message when it is missing or blank.
+def setting!(name)
+  value = ENV[name].to_s.strip
+  UI.user_error!("#{name} is not set (credentials and options live in fastlane/.env, see .env.example)") if value.empty?
+  value
+end
+
+# A setting that names a file, checked before fastlane tries to use it.
+def file_setting!(name)
+  path = File.expand_path(setting!(name))
+  UI.user_error!("#{name} points to a missing file: #{path}") unless File.file?(path)
+  path
+end
+
 lane :ios_upload do
-  ipa = ENV["IPA_PATH"] || UI.user_error!("IPA_PATH is not set")
+  ipa = file_setting!("IPA_PATH")
 
   api_key = app_store_connect_api_key(
-    key_id: ENV.fetch("ASC_KEY_ID"),
-    issuer_id: ENV.fetch("ASC_ISSUER_ID"),
-    key_filepath: File.expand_path(ENV.fetch("ASC_KEY_PATH")),
+    key_id: setting!("ASC_KEY_ID"),
+    issuer_id: setting!("ASC_ISSUER_ID"),
+    key_filepath: file_setting!("ASC_KEY_PATH"),
   )
 
   upload_to_testflight(
@@ -20,12 +34,14 @@ lane :ios_upload do
 end
 
 lane :android_upload do
-  aab = ENV["AAB_PATH"] || UI.user_error!("AAB_PATH is not set")
+  aab = file_setting!("AAB_PATH")
 
   upload_to_play_store(
-    package_name: ENV["ANDROID_PACKAGE"] || UI.user_error!("ANDROID_PACKAGE is not set"),
-    json_key: File.expand_path(ENV.fetch("PLAY_JSON_KEY_PATH")),
-    track: ENV.fetch("PLAY_TRACK", "internal"),
+    package_name: setting!("ANDROID_PACKAGE"),
+    json_key: file_setting!("PLAY_JSON_KEY_PATH"),
+    track: ENV["PLAY_TRACK"].to_s.strip.then { |t| t.empty? ? "internal" : t },
+    # An app that was never published only accepts "draft" here (set PLAY_RELEASE_STATUS=draft once).
+    release_status: ENV["PLAY_RELEASE_STATUS"].to_s.strip.then { |s| s.empty? ? "completed" : s },
     aab: aab,
     skip_upload_metadata: true,
     skip_upload_images: true,
