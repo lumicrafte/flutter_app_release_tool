@@ -214,10 +214,17 @@ EOF2
 # A row must never wrap, or the redraw (cursor up n lines) breaks, so the note is cut to the terminal width.
 # A plain option is shown as one dim line when not selected.
 choose() {
-  local title="$1" sel="$2" n i key rest p s t cols pw sw room
+  local title="$1" sel="$2" n i key rest p s t cols pw=0 sw=0 room
   shift 2
   local opts=("$@")
   n=${#opts[@]}
+  # Column widths come from the options themselves, so a badge has the same space on both sides of its text.
+  for ((i = 0; i < n; i++)); do
+    [[ "${opts[$i]}" == *$'\t'* ]] || continue
+    p="${opts[$i]%%$'\t'*}"; rest="${opts[$i]#*$'\t'}"; s="${rest%%$'\t'*}"
+    [ "${#p}" -le "$pw" ] || pw=${#p}
+    [ "${#s}" -le "$sw" ] || sw=${#s}
+  done
   cols="$(stty size 2>/dev/null | awk '{print $2}')"          # stdin is the terminal here
   case "$cols" in ''|*[!0-9]*|0) cols=80 ;; esac
   draw() {
@@ -225,12 +232,11 @@ choose() {
       printf '\033[2K\r'
       if [[ "${opts[$i]}" == *$'\t'* ]]; then
         p="${opts[$i]%%$'\t'*}"; rest="${opts[$i]#*$'\t'}"; s="${rest%%$'\t'*}"; t="${rest#*$'\t'}"
-        pw=$(( ${#p} > 8 ? ${#p} : 8 )); sw=$(( ${#s} > 9 ? ${#s} : 9 ))
-        room=$(( cols - (2 + 1 + 1 + pw + 1 + 1 + sw + 1 + 1) - 1 ))      # columns left for the note
+        room=$(( cols - (2 + 1 + 1 + pw + 1 + 1 + sw + 1 + 2) - 1 ))      # columns left for the note
         if [ "$room" -lt 8 ]; then t=""
         elif [ "${#t}" -gt "$room" ]; then t="${t:0:$((room - 3))}..."; fi
-        if [ "$i" -eq "$sel" ]; then printf '  \033[36m●\033[0m \033[1m%-*s\033[0m \033[46;30m %-*s \033[0m %s\n' "$pw" "$p" "$sw" "$s" "$t"
-        else printf '  \033[2m○\033[0m %-*s \033[48;5;238;38;5;250m %-*s \033[0m \033[2m%s\033[0m\n' "$pw" "$p" "$sw" "$s" "$t"; fi
+        if [ "$i" -eq "$sel" ]; then printf '  \033[36m●\033[0m \033[1m%-*s\033[0m \033[46;30m %-*s \033[0m  %s\n' "$pw" "$p" "$sw" "$s" "$t"
+        else printf '  \033[2m○\033[0m %-*s \033[48;5;238;38;5;250m %-*s \033[0m  \033[2m%s\033[0m\n' "$pw" "$p" "$sw" "$s" "$t"; fi
       elif [ "$i" -eq "$sel" ]; then printf '  \033[36m●\033[0m %s\n' "${opts[$i]}"
       else printf '  \033[2m○ %s\033[0m\n' "${opts[$i]}"; fi
     done
