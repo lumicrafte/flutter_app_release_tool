@@ -208,19 +208,34 @@ EOF2
 
 # ---- prompts ----------------------------------------------------------------
 # choose "Question" DEFAULT_INDEX option... -> sets CHOICE (0-based). Arrow keys or j/k, enter to pick.
+# An option may be "primary<TAB>secondary<TAB>note". On the selected row the primary is bold, the secondary
+# sits on a cyan badge and the note is in the normal text colour; other rows have a grey badge and a dim note.
+# Badge colours set foreground and background together, so they read on light and dark terminals.
+# A row must never wrap, or the redraw (cursor up n lines) breaks, so the note is cut to the terminal width.
+# A plain option is shown as one dim line when not selected.
 choose() {
-  local title="$1" sel="$2" n i key rest
+  local title="$1" sel="$2" n i key rest p s t cols pw sw room
   shift 2
   local opts=("$@")
   n=${#opts[@]}
+  cols="$(stty size 2>/dev/null | awk '{print $2}')"          # stdin is the terminal here
+  case "$cols" in ''|*[!0-9]*|0) cols=80 ;; esac
   draw() {
     for ((i = 0; i < n; i++)); do
       printf '\033[2K\r'
-      if [ "$i" -eq "$sel" ]; then printf '  \033[36m●\033[0m %s\n' "${opts[$i]}"
+      if [[ "${opts[$i]}" == *$'\t'* ]]; then
+        p="${opts[$i]%%$'\t'*}"; rest="${opts[$i]#*$'\t'}"; s="${rest%%$'\t'*}"; t="${rest#*$'\t'}"
+        pw=$(( ${#p} > 8 ? ${#p} : 8 )); sw=$(( ${#s} > 9 ? ${#s} : 9 ))
+        room=$(( cols - (2 + 1 + 1 + pw + 1 + 1 + sw + 1 + 1) - 1 ))      # columns left for the note
+        if [ "$room" -lt 8 ]; then t=""
+        elif [ "${#t}" -gt "$room" ]; then t="${t:0:$((room - 3))}..."; fi
+        if [ "$i" -eq "$sel" ]; then printf '  \033[36m●\033[0m \033[1m%-*s\033[0m \033[46;30m %-*s \033[0m %s\n' "$pw" "$p" "$sw" "$s" "$t"
+        else printf '  \033[2m○\033[0m %-*s \033[48;5;238;38;5;250m %-*s \033[0m \033[2m%s\033[0m\n' "$pw" "$p" "$sw" "$s" "$t"; fi
+      elif [ "$i" -eq "$sel" ]; then printf '  \033[36m●\033[0m %s\n' "${opts[$i]}"
       else printf '  \033[2m○ %s\033[0m\n' "${opts[$i]}"; fi
     done
   }
-  printf '\033[36m◆\033[0m %s\n' "$title"
+  printf '\033[36m◆\033[0m \033[1m%s\033[0m\n' "$title"
   draw
   while true; do
     IFS= read -rsn1 key || exit 1
@@ -240,7 +255,9 @@ choose() {
     draw
   done
   printf '\033[%dA\033[J' "$((n + 1))"
-  printf '\033[32m✔\033[0m %s \033[2m%s\033[0m\n' "$title" "${opts[$sel]}"
+  p="${opts[$sel]}"
+  if [[ "$p" == *$'\t'* ]]; then rest="${p#*$'\t'}"; p="${p%%$'\t'*} ${rest%%$'\t'*}"; fi
+  printf '\033[32m✔\033[0m %s \033[2m%s\033[0m\n' "$title" "$p"
   CHOICE=$sel
 }
 
@@ -412,14 +429,15 @@ done
 # No bump type on the command line: ask, but only on a terminal.
 if [ -z "$MODE" ]; then
   [ -t 0 ] || usage 1
-  echo "Release $CURRENT"; echo
+  printf '\033[1mRelease\033[0m \033[36m%s\033[0m\n\n' "$CURRENT"
+  bump_label() { printf '%s\t%s\t%s' "$1" "$2" "$3"; }      # name, version, when to use it
   choose "Version bump" 0 \
-    "patch   $(next_version patch)" \
-    "minor   $(next_version minor)" \
-    "major   $(next_version major)" \
-    "build   $(next_version build)  (build number only)" \
-    "current $CURRENT  (current version)" \
-    "upload  $CURRENT  (upload the existing build, no rebuild)"
+    "$(bump_label patch "$(next_version patch)" "a fix or small improvement")" \
+    "$(bump_label minor "$(next_version minor)" "a new feature; nothing breaks")" \
+    "$(bump_label major "$(next_version major)" "a breaking change or big redesign")" \
+    "$(bump_label build "$(next_version build)" "no visible change; new binary after a rejection")" \
+    "$(bump_label current "$CURRENT" "same version, build the other platform")" \
+    "$(bump_label upload "$CURRENT" "send the existing build, no rebuild")"
   MODE="$(echo "patch minor major build current upload" | cut -d' ' -f$((CHOICE + 1)))"
   # Rebuilding or uploading the current version changes nothing to commit or tag.
   if [ "$MODE" = "current" ] || [ "$MODE" = "upload" ]; then COMMIT=0; TAG=0; SET_COMMIT=1; SET_TAG=1; fi
