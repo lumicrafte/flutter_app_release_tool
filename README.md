@@ -93,3 +93,23 @@ release update      # alias: release upgrade
 ```
 
 Fast-forwards the install to the latest commit and lists what changed. It works from any folder and only pulls: it does not redo the installer's other steps (the `release` link, the PATH entry, creating `fastlane/.env`). To redo those, re-run the install one-liner. It stops with a message if the install has local changes or has diverged from the remote.
+
+## When an upload fails
+
+A failed upload is usually a store-side problem (a declaration missing in Play Console, an agreement to accept), and the build itself is fine. So the build, the version commit and any tag are **kept**, and `release` prints how to retry:
+
+```
+release upload --android     # after fixing the problem in the store
+```
+
+Each successful upload leaves a marker in `.git/release-tools/` (`uploaded-<version>-ios` or `-android`). It lives in `.git` so `flutter clean` and `release clean` cannot erase it, and it is never committed. `release upload` skips a platform that already has a marker, so a retry never uploads twice; delete the marker file to upload again.
+
+To take a release back instead:
+
+```
+release undo                 # remove the release commit, its tag and its build folder
+```
+
+`release undo` asks first, and refuses when the release commit is already pushed, when HEAD has moved past it, or when the tag is on the remote. It also refuses after a successful upload, because that build number is taken on the store; `--force` overrides that. It also works on a bump you left uncommitted with `--no-commit`.
+
+`release patch --upload --rollback-on-failure` does the same undo automatically, but only when no platform was uploaded.

@@ -15,6 +15,7 @@ USAGE
   release                          ask each question in turn
   release <bump> [options]         run without questions
   release clean [options]          delete old builds
+  release undo [options]           take back the last release (commit, tag, build files)
   release signing <file>           remember the Android signing file
   release update                   install the latest release-tools (alias: upgrade)
   release help                     show this help
@@ -32,11 +33,16 @@ OPTIONS (builds and uploads)
   --no-commit              leave the version bump uncommitted (default: commit pubspec.yaml)
   --tag                    tag the release commit as <app>/v<version> (default: no tag)
   --allow-dirty            allow unrelated uncommitted changes (only pubspec.yaml is committed)
+  --rollback-on-failure    if every upload fails, undo the release (default: keep the build for a retry)
 
 CLEAN OPTIONS
   --keep N                 builds to keep, newest first (default: 3; the current version always stays)
   --dry-run                list what would be deleted
   --yes, -y                do not ask first
+
+UNDO OPTIONS
+  --yes, -y                do not ask first
+  --force                  undo even though a platform was already uploaded (its build number stays taken)
 
 EXAMPLES
   release                              interactive release
@@ -44,6 +50,7 @@ EXAMPLES
   release minor --android --tag        Android-only minor release, tagged
   release current --ios --upload       build and upload iOS for the version already released
   release upload                       retry an upload without rebuilding
+  release undo                         take back the last release if it was never pushed or uploaded
   release clean --dry-run              see what old builds would be removed
 
 FILES
@@ -54,6 +61,7 @@ FILES
   ~/.config/release-tools/config       the signing file path, set once by `release signing`
   <install>/fastlane/.env              App Store Connect and Play credentials (see .env.example)
   build/releases/<version>/            the IPA and AAB of each release
+  .git/release-tools/uploaded-*        records of what reached a store (kept out of build/ and of commits)
 HELP
 }
 
@@ -236,6 +244,98 @@ choose() {
   CHOICE=$sel
 }
 
+# ---- upload markers ----------------------------------------------------------
+# A marker records that a platform of a version reached its store, so that build number is taken. It lives
+# in .git, which neither `flutter clean` nor `release clean` touches, and is never committed.
+GIT_DIR_ABS="$(git rev-parse --absolute-git-dir)"
+marker_path() { echo "$GIT_DIR_ABS/release-tools/uploaded-$1-$2"; }       # version, platform
+mark_uploaded() { mkdir -p "$GIT_DIR_ABS/release-tools" && : > "$(marker_path "$1" "$2")"; }
+uploaded_platforms() {                                                     # version -> "ios android"
+  local f out=""
+  for f in "$GIT_DIR_ABS/release-tools/uploaded-$1"-*; do
+    [ -e "$f" ] && out="$out ${f##*-}"
+  done
+  echo "${out# }"
+}
+
+# ---- undo -------------------------------------------------------------------
+# Takes back a release: the tag, the release commit (or the uncommitted bump), and its build folder.
+# $1 commit|worktree, $2 the version being removed, $3 the tag to delete (may be empty),
+# $4 the version to go back to (used for an uncommitted bump).
+revert_release() {
+  local mode="$1" ver="$2" tag="${3:-}" back_to="${4:-}"
+  if [ -n "$tag" ] && git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+    git tag -d "$tag" >/dev/null && echo "removed tag $tag"
+  fi
+  if [ "$mode" = "commit" ]; then
+    git reset --soft HEAD~1 && git checkout HEAD -- "$PUBSPEC"
+    echo "removed the release commit"
+  else
+    # Only the version line changes, so other edits to pubspec.yaml (a new dependency, say) are kept.
+    sed -E -i '' "s/^version:.*/version: $back_to/" "$PUBSPEC"
+  fi
+  rm -f "$GIT_DIR_ABS"/release-tools/uploaded-"$ver"-*
+  rm -rf "${ROOT:?}/build/releases/$ver"
+  echo "removed build/releases/$ver; $PUBSPEC is back to $(sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+).*/\1/p' "$PUBSPEC" | head -n 1)"
+}
+
+if [ "${1:-}" = "undo" ]; then
+  shift
+  ASSUME_YES=0; FORCE=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) ASSUME_YES=1 ;;
+      --force) FORCE=1 ;;
+      *) die "unknown undo option: $1" ;;
+    esac
+    shift
+  done
+
+  version_of() { sed -nE 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+\+[0-9]+).*/\1/p' | head -n 1; }
+  head_version="$(git show "HEAD:$PUBSPEC" | version_of)"
+  tag="$TAG_PREFIX/v$CURRENT"
+
+  if [ "$head_version" != "$CURRENT" ]; then
+    mode="worktree"; back_to="$head_version"      # a bump that was never committed (--no-commit)
+  else
+    [ "$(git log -1 --format=%s)" = "release: $APP_NAME $CURRENT" ] \
+      || die "HEAD is not the release commit for $CURRENT, so there is nothing to undo"
+    [ -z "$(git branch -r --contains HEAD 2>/dev/null)" ] \
+      || die "the release commit is already pushed; undo it by hand"
+    git rev-parse -q --verify HEAD~1 >/dev/null || die "the release commit has no parent"
+    mode="commit"; back_to="$(git show "HEAD~1:$PUBSPEC" | version_of)"
+  fi
+
+  if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+    rc=0; git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+      0) die "tag $tag is already on the remote; undo it by hand" ;;
+      2) ;;
+      *) echo "warning: could not check the remote for tag $tag" >&2 ;;
+    esac
+  else
+    tag=""
+  fi
+
+  uploaded="$(uploaded_platforms "$CURRENT")"
+  if [ -n "$uploaded" ] && [ "$FORCE" = 0 ]; then
+    die "$CURRENT was uploaded to: $uploaded. That build number is taken, so a new release would reuse it. Pass --force to undo anyway"
+  fi
+
+  echo "Undo release $CURRENT, back to $back_to:"
+  [ "$mode" = "commit" ] && echo "  - remove the commit \"release: $APP_NAME $CURRENT\""
+  [ "$mode" = "worktree" ] && echo "  - restore $PUBSPEC (the bump was never committed)"
+  [ -z "$tag" ] || echo "  - delete the tag $tag"
+  echo "  - delete build/releases/$CURRENT"
+  if [ "$ASSUME_YES" = 0 ]; then
+    [ -t 0 ] || die "not a terminal; pass --yes to undo"
+    choose "Undo release $CURRENT?" 0 "No, keep it" "Yes, undo"
+    [ "$CHOICE" = 1 ] || exit 1
+  fi
+  revert_release "$mode" "$CURRENT" "$tag" "$back_to"
+  exit 0
+fi
+
 # ---- clean ------------------------------------------------------------------
 # Removes old build/releases/<version>/ folders, newest build numbers kept. The version in
 # pubspec.yaml is never removed, because `release current` and `release upload` use it.
@@ -290,7 +390,7 @@ fi
 # ---- args -------------------------------------------------------------------
 MODE=""
 DO_IOS=0; DO_ANDROID=0
-UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0
+UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0; ROLLBACK_ON_FAIL=0
 SET_PLATFORM=0; SET_UPLOAD=0; SET_COMMIT=0; SET_TAG=0
 
 for arg in "$@"; do
@@ -303,6 +403,7 @@ for arg in "$@"; do
     --no-commit) COMMIT=0; SET_COMMIT=1 ;;
     --tag) TAG=1; SET_TAG=1 ;;
     --allow-dirty) DIRTY_OK=1 ;;
+    --rollback-on-failure) ROLLBACK_ON_FAIL=1 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $arg" >&2; usage 1 ;;
   esac
@@ -408,7 +509,7 @@ if [ "$UPLOAD" = 1 ]; then
   [ -f "$FASTFILE" ] || die "--upload needs $FASTFILE"
 fi
 
-IPA=""; AAB=""
+IPA=""; AAB=""; RELEASE_COMMIT=""; TAG_MADE=0
 if [ "$MODE" = "upload" ]; then
   # Without --ios/--android, upload whichever platforms were built for this version.
   if [ "$DO_IOS" = 1 ]; then
@@ -421,6 +522,13 @@ if [ "$MODE" = "upload" ]; then
       [ "$SET_PLATFORM" = 0 ] || die "no .aab at $AAB (build it first: release current --android)"
       AAB=""
     fi
+  fi
+  ALREADY=""
+  if [ -n "$IPA" ] && [ -f "$(marker_path "$NEXT" ios)" ]; then ALREADY="$ALREADY ios"; IPA=""; fi
+  if [ -n "$AAB" ] && [ -f "$(marker_path "$NEXT" android)" ]; then ALREADY="$ALREADY android"; AAB=""; fi
+  if [ -z "$IPA$AAB" ] && [ -n "$ALREADY" ]; then
+    echo "already uploaded:$ALREADY (to upload again, delete $GIT_DIR_ABS/release-tools/uploaded-$NEXT-*)"
+    exit 0
   fi
   [ -n "$IPA$AAB" ] || die "nothing to upload in $OUT_DIR for $CURRENT"
 fi
@@ -493,8 +601,10 @@ if [ "$COMMIT" = 1 ]; then
   step "Commit $NEXT"
   git add "$PUBSPEC"
   git commit -m "release: $APP_NAME $NEXT" -- "$PUBSPEC"
+  RELEASE_COMMIT="$(git rev-parse HEAD)"
   if [ "$TAG" = 1 ]; then
     git tag "$TAG_NAME"
+    TAG_MADE=1
     echo "tagged $TAG_NAME"
   fi
 fi
@@ -506,18 +616,48 @@ run_lane() {
   (cd "$TOOLS_DIR" && FASTLANE_SKIP_UPDATE_CHECK=1 FASTLANE_HIDE_CHANGELOG=1 FASTLANE_SKIP_DOCS=1 fastlane "$@")
 }
 
-UPLOAD_FAILED=0
+UPLOAD_FAILED=0; UPLOADED=0; FAILED=""
 if [ "$UPLOAD" = 1 ]; then
   if [ -n "$IPA" ]; then
-    step "Upload iOS to TestFlight"
-    IPA_PATH="$IPA" run_lane ios_upload \
-      || { UPLOAD_FAILED=1; echo "iOS upload failed; retry: release upload --ios" >&2; }
+    if [ -f "$(marker_path "$NEXT" ios)" ]; then
+      echo "iOS $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" ios) to upload again)"
+    else
+      step "Upload iOS to TestFlight"
+      if IPA_PATH="$IPA" run_lane ios_upload; then mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
+      else UPLOAD_FAILED=1; FAILED="$FAILED ios"; fi
+    fi
   fi
   if [ -n "$AAB" ]; then
-    step "Upload Android to Play"
-    AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" run_lane android_upload \
-      || { UPLOAD_FAILED=1; echo "Android upload failed; retry: release upload --android" >&2; }
+    if [ -f "$(marker_path "$NEXT" android)" ]; then
+      echo "Android $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" android) to upload again)"
+    else
+      step "Upload Android to Play"
+      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" run_lane android_upload; then mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
+      else UPLOAD_FAILED=1; FAILED="$FAILED android"; fi
+    fi
   fi
+fi
+
+if [ "$UPLOAD_FAILED" = 1 ]; then
+  # A failed upload is usually a store-side problem (a console declaration, an agreement), and the build is
+  # fine. So the build, commit and tag are kept by default. --rollback-on-failure undoes them, but only when
+  # nothing reached a store: an uploaded build number is taken and must not be reused.
+  taken=0; [ -z "$(uploaded_platforms "$NEXT")" ] || taken=1
+  if [ "$ROLLBACK_ON_FAIL" = 1 ] && [ "$taken" = 0 ] && [ "$NEXT" != "$CURRENT" ] \
+     && { [ -z "$RELEASE_COMMIT" ] || [ "$(git rev-parse HEAD)" = "$RELEASE_COMMIT" ]; }; then
+    step "Upload failed: undoing release $NEXT"
+    if [ -n "$RELEASE_COMMIT" ]; then
+      revert_release commit "$NEXT" "$([ "$TAG_MADE" = 1 ] && echo "$TAG_NAME")" "$CURRENT"
+    else
+      revert_release worktree "$NEXT" "" "$CURRENT"
+    fi
+    exit 1
+  fi
+  echo >&2
+  echo "Upload failed for:$FAILED. The build is fine and is kept in $OUT_DIR." >&2
+  echo "Fix the problem on the store side, then retry with:" >&2
+  for p in $FAILED; do echo "  release upload --$p" >&2; done
+  echo "To take the release back instead: release undo" >&2
 fi
 
 # ---- summary ----------------------------------------------------------------
