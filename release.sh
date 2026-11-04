@@ -99,14 +99,90 @@ warn_loose() {
 check_signing_file() {
   local key missing=""
   for key in KEY_ALIAS KEY_PATH KEY_STORE_PASSWORD KEY_PASSWORD; do
-    grep -q "^$key=." "$1" || missing="$missing $key"
+    [ -n "$(prop_java "$1" "$key")" ] || missing="$missing $key"
   done
   [ -z "$missing" ] || die "$1 is missing:$missing"
   local jks
-  jks="$(sed -n 's/^KEY_PATH=//p' "$1" | head -n 1)"
+  jks="$(prop_java "$1" KEY_PATH)"; jks="${jks/#\~/$HOME}"
   [ -f "$jks" ] || die "KEY_PATH in $1 is not a file: $jks"
   warn_loose "$1"
   warn_loose "$jks"
+}
+
+# A value from the signing file exactly as Gradle reads it (java.util.Properties): "key = value", "key: value"
+# and "key=value" all work, leading spaces after the separator are dropped, but trailing spaces and quotes are
+# kept and a backslash escapes the next character. The .env file below is read the way fastlane reads it instead.
+prop_java() {
+  local v
+  v="$(sed -n -E "s/^[[:space:]]*$2[[:space:]]*[=:][[:space:]]*//p" "$1" 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+  case "$v" in
+    *\\*) v="$(printf '%s' "$v" | perl -pe 's/\\(.)/$1/g' 2>/dev/null || printf '%s' "$v")" ;;
+  esac
+  printf '%s' "$v"
+}
+
+# A "KEY=value" line from a file: surrounding spaces, quotes and carriage returns removed, as fastlane's loader does.
+value_in() {
+  sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 | tr -d '\r' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
+}
+
+# Runs a command and stops it after N seconds, so a broken stub can never hang the tool (macOS has no
+# `timeout`). Returns 124 when it had to be stopped.
+run_with_timeout() {
+  local secs="$1" pid killer rc
+  shift
+  "$@" & pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & killer=$!
+  wait "$pid" 2>/dev/null && rc=0 || rc=$?
+  kill "$killer" 2>/dev/null || true
+  [ "$rc" -lt 128 ] || return 124
+  return "$rc"
+}
+
+# Every usable jarsigner, one per line: the one on PATH, JAVA_HOME's, then Android Studio's. Gradle may use any
+# of them, so a password counts as good if any accepts it. macOS ships a stub at /usr/bin/jarsigner that only
+# complains when no JDK is installed, so each candidate must actually print its usage.
+find_jarsigners() {
+  local c seen=""
+  for c in "$(command -v jarsigner 2>/dev/null || true)" "${JAVA_HOME:+$JAVA_HOME/bin/jarsigner}" \
+           "/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/jarsigner" \
+           "$HOME/Applications/Android Studio.app/Contents/jbr/Contents/Home/bin/jarsigner"; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    case "$seen" in *"|$c|"*) continue ;; esac
+    seen="$seen|$c|"
+    run_with_timeout 5 "$c" -help 2>&1 | grep -qi usage && echo "$c"
+  done
+  return 0
+}
+
+# Opens the keystore with the passwords from a signing file by signing a throwaway zip, which is what a real
+# release does. Prints one word: ok | incomplete | no-tool | store | key | alias | other. Passwords go to the JDK
+# through environment variables, never on a command line, and are never printed. With several JDKs available it
+# is ok when any accepts them, and otherwise reports what the first one said.
+keystore_check() {
+  local f="$1" alias sp kp jks tools tool tmp out first=""
+  local -x JT_STOREPASS JT_KEYPASS          # exported only for this function's children
+  alias="$(prop_java "$f" KEY_ALIAS)"; sp="$(prop_java "$f" KEY_STORE_PASSWORD)"
+  kp="$(prop_java "$f" KEY_PASSWORD)"; jks="$(prop_java "$f" KEY_PATH)"; jks="${jks/#\~/$HOME}"
+  JT_STOREPASS="$sp"; JT_KEYPASS="$kp"
+  if [ -z "$alias" ] || [ -z "$sp" ] || [ -z "$kp" ] || [ ! -f "$jks" ]; then echo incomplete; return 0; fi
+  tools="$(find_jarsigners)"
+  if [ -z "$tools" ] || ! command -v zip >/dev/null; then echo no-tool; return 0; fi
+  tmp="$(mktemp -d)"
+  while IFS= read -r tool; do
+    ( cd "${tmp:?}" && echo x > a.txt && rm -f t.zip && zip -q t.zip a.txt )
+    out="$(run_with_timeout 30 "$tool" -keystore "$jks" -storepass:env JT_STOREPASS \
+            -keypass:env JT_KEYPASS "${tmp:?}/t.zip" "$alias" 2>&1)" && { rm -rf "${tmp:?}"; echo ok; return 0; }
+    case "$out" in
+      *"password was incorrect"* | *"Keystore was tampered"*) [ -n "$first" ] || first=store ;;
+      *"not a private key"* | *"Cannot recover key"* | *"UnrecoverableKey"* | *"Get Key failed"* | *"padded"*) [ -n "$first" ] || first=key ;;
+      *"Certificate chain not found"* | *"does not exist"* | *"No key"*) [ -n "$first" ] || first=alias ;;
+      *) [ -n "$first" ] || first=other ;;
+    esac
+  done <<<"$tools"
+  rm -rf "${tmp:?}"
+  echo "$first"
 }
 
 saved_signing_path() { sed -n 's/^KEYSTORE_PROPERTIES=//p' "$GLOBAL_CONFIG" 2>/dev/null | head -n 1 || true; }
@@ -170,11 +246,6 @@ doctor_run() {
   warn() { row "$1" "$Y[!]$O" "$2" "$3"; warnings=$((warnings + 1)); }
   skip() { row "$1" "$D[–]$O" "$2" "$3"; }
 
-  # A "KEY=value" line from a file: surrounding spaces, quotes and carriage returns removed, as fastlane's loader does.
-  value_in() {
-    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 | tr -d '\r' \
-      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
-  }
   loose() {                                                                       # file readable by group or others?
     local m; m="$(file_mode "$1")"
     [ -n "$m" ] && [ $((m % 100)) -ne 0 ]
@@ -220,14 +291,28 @@ doctor_run() {
   else
     pass "  " "signing file" "$sf"
     for k in KEY_ALIAS KEY_STORE_PASSWORD KEY_PASSWORD; do
-      if [ -n "$(value_in "$sf" "$k")" ]; then pass "    " "$k" "set"; else fail "    " "$k" "missing or empty"; fi
+      v="$(prop_java "$sf" "$k")"
+      if [ -z "$v" ]; then fail "    " "$k" "missing or empty"; else pass "    " "$k" "set"; fi
+      # Gradle takes these literally, unlike a shell or a .env file, so they are usually a mistake.
+      if [[ "$v" =~ ^[\"\'].*[\"\']$ ]]; then warn "    " "$k quotes" "has surrounding quotes; Gradle keeps them as part of the value"; fi
+      if [[ "$v" =~ [[:space:]]$ ]]; then warn "    " "$k spaces" "ends with a space; Gradle keeps it as part of the value"; fi
+      if grep -qE "^[[:space:]]*$k[[:space:]]*[=:].*\\\\" "$sf" 2>/dev/null; then warn "    " "$k backslash" "contains a backslash; Gradle reads it as an escape character"; fi
     done
-    v="$(value_in "$sf" KEY_PATH)"
+    v="$(prop_java "$sf" KEY_PATH)"
     if [ -z "$v" ]; then fail "    " KEY_PATH "missing or empty"
     elif [ ! -f "${v/#\~/$HOME}" ]; then fail "    " KEY_PATH "no keystore file at that path"
     else
       pass "    " KEY_PATH "keystore file found"
       if loose "${v/#\~/$HOME}"; then warn "    " "keystore access" "readable by other users: chmod 600 on the keystore"; fi
+      case "$(keystore_check "$sf")" in
+        ok)         pass "    " passwords "the keystore opens and the alias signs" ;;
+        no-tool)    skip "    " passwords "not checked: jarsigner (a JDK) or zip not found" ;;
+        store)      fail "    " KEY_STORE_PASSWORD "rejected by the keystore" ;;
+        key)        fail "    " KEY_PASSWORD "rejected (the store password is right)" ;;
+        alias)      fail "    " KEY_ALIAS "no key with that alias in the keystore" ;;
+        incomplete) ;;
+        *)          fail "    " passwords "the keystore did not open with these settings" ;;
+      esac
     fi
     if loose "$sf"; then warn "    " "file access" "readable by other users: chmod 600 \"$sf\""; fi
   fi
@@ -649,6 +734,12 @@ if [ "$DO_ANDROID" = 1 ] && [ "$MODE" != "upload" ]; then
   fi
   if [ -f "${KEYSTORE_PROPERTIES:-}" ]; then
     check_signing_file "$KEYSTORE_PROPERTIES"
+    case "$(keystore_check "$KEYSTORE_PROPERTIES")" in
+      store) die "KEY_STORE_PASSWORD is rejected by the keystore in $KEYSTORE_PROPERTIES (run: release doctor)" ;;
+      key)   die "KEY_PASSWORD is rejected by the keystore in $KEYSTORE_PROPERTIES (run: release doctor)" ;;
+      alias) die "KEY_ALIAS has no key in the keystore from $KEYSTORE_PROPERTIES (run: release doctor)" ;;
+      other) die "the keystore from $KEYSTORE_PROPERTIES did not open with its settings (run: release doctor)" ;;
+    esac
     export KEYSTORE_PROPERTIES
   fi
 fi
