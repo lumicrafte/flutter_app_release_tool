@@ -42,21 +42,50 @@ case ":$PATH:" in
     fi ;;
 esac
 
-# What is still missing. Only names and file existence are checked; no value is read out or printed.
+# What is still missing. Only names, formats and file existence are checked; no value is ever printed.
 env_file="$DIR/fastlane/.env"
-# The value of a key, as fastlane's .env loader sees it: no surrounding quotes, no trailing carriage return.
+# The value of a key, as fastlane's .env loader sees it: no surrounding quotes, spaces or carriage return.
 env_value() {
   sed -n "s/^$1=//p" "$env_file" 2>/dev/null | head -n 1 | tr -d '\r' \
-    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
 }
-env_has() { [ -n "$(env_value "$1")" ]; }                                       # key has a value
-env_file_exists() {                                                              # key names a file that exists
-  local v; v="$(env_value "$1")"
-  [ -n "$v" ] && [ -f "${v/#\~/$HOME}" ]
+
+# Prints why a setting is not usable (nothing when it is fine). Formats Apple and Google use:
+# key id = 10 capital letters or digits, issuer id = a UUID, key = an existing .p8, Play key = an existing .json.
+setting_problem() {
+  local key="$1" v ext="" key_id='^[A-Z0-9]{10}$' uuid='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
+  v="$(env_value "$key")"
+  [ -n "$v" ] || { echo "$key is empty"; return 0; }
+  case "$key" in
+    ASC_KEY_ID)         [[ "$v" =~ $key_id ]] || echo "$key should be 10 capital letters or digits" ;;
+    ASC_ISSUER_ID)      [[ "$v" =~ $uuid ]] || echo "$key should be a UUID like 69a6de70-03db-47e3-e053-5b8c7c11a4d1" ;;
+    ASC_KEY_PATH)       ext=p8 ;;
+    PLAY_JSON_KEY_PATH) ext=json ;;
+  esac
+  if [ -n "$ext" ]; then
+    if [ "${v##*.}" != "$ext" ]; then echo "$key should be a path ending in .$ext"
+    elif [ ! -f "${v/#\~/$HOME}" ]; then echo "$key: there is no file at that path"; fi
+  fi
 }
 
 todo=""
 add() { todo="$todo$1"$'\n'; }
+
+# One section of upload settings: silent about a store that was never set up, specific about a half-set one.
+check_uploads() {                                    # $1 label, rest: the keys
+  local label="$1" key v p set=0
+  shift
+  # A value that is still the placeholder from .env.example counts as not set.
+  for key in "$@"; do
+    v="$(env_value "$key")"
+    [ -z "$v" ] || [ "$v" = "$(sed -n "s/^$key=//p" "$DIR/fastlane/.env.example" 2>/dev/null | head -n 1 || true)" ] || set=1
+  done
+  if [ "$set" = 0 ]; then local names="$*"; add "$label uploads (optional): not set up (${names// /, })"; return 0; fi
+  for key in "$@"; do
+    p="$(setting_problem "$key")"
+    [ -z "$p" ] || add "$label uploads: $p"
+  done
+}
 
 have_flutter=0
 need flutter && have_flutter=1
@@ -70,10 +99,8 @@ signing="$(sed -n 's/^KEYSTORE_PROPERTIES=//p' "$HOME/.config/release-tools/conf
 [ -n "$signing" ] && [ -f "$signing" ] \
   || add "Android signing: release signing /path/to/keystore.properties   (KEY_ALIAS, KEY_PATH, KEY_STORE_PASSWORD, KEY_PASSWORD)"
 
-if ! { env_has ASC_KEY_ID && env_has ASC_ISSUER_ID && env_file_exists ASC_KEY_PATH; }; then
-  add "iOS uploads (optional): set ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_PATH in $env_file"
-fi
-env_file_exists PLAY_JSON_KEY_PATH || add "Play uploads (optional): set PLAY_JSON_KEY_PATH in $env_file"
+check_uploads iOS ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_PATH
+check_uploads Play PLAY_JSON_KEY_PATH
 
 say ""
 if [ -z "$todo" ]; then
@@ -81,6 +108,7 @@ if [ -z "$todo" ]; then
 else
   say "Installed. Still to do:"
   while IFS= read -r line; do [ -z "$line" ] || say "  - $line"; done <<<"$todo"
+  case "$todo" in *uploads*) say ""; say "Upload settings live in $env_file" ;; esac
   say ""
   say "Then, in any Flutter app, run \`release\`."
 fi
