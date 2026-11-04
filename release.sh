@@ -7,6 +7,15 @@ set -euo pipefail
 die() { echo "error: $*" >&2; exit 1; }
 step() { echo; echo "==> $*"; }
 
+# A file's permission bits as an octal number such as 600; empty when they cannot be read.
+# GNU stat takes -c, macOS stat takes -f. Anything that is not a number is dropped.
+file_mode() {
+  local m
+  m="$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || true)"
+  case "$m" in ''|*[!0-7]*) return 0 ;; esac
+  echo "$m"
+}
+
 print_help() {
   cat <<'HELP'
 release: build and ship a Flutter app to TestFlight and Google Play
@@ -18,6 +27,7 @@ USAGE
   release undo [options]           take back the last release (commit, tag, build files)
   release signing <file>           remember the Android signing file
   release update                   install the latest release-tools (alias: upgrade)
+  release doctor                   check the tools, signing file and upload settings
   release help                     show this help
 
 BUMPS
@@ -76,10 +86,10 @@ case " $* " in *" -h "* | *" --help "*) usage 0 ;; esac
 # The Android signing file is machine-level: remembered once in ~/.config/release-tools/config.
 GLOBAL_CONFIG="$HOME/.config/release-tools/config"
 
-# Warn when a secrets file can be read by other local users (macOS stat).
+# Warn when a secrets file can be read by other local users.
 warn_loose() {
   local mode
-  mode="$(stat -f %Lp "$1" 2>/dev/null || true)"
+  mode="$(file_mode "$1")"
   if [ -n "$mode" ] && [ $((mode % 100)) -ne 0 ]; then
     echo "warning: $1 is readable by other users (mode $mode); run: chmod 600 \"$1\"" >&2
   fi
@@ -147,6 +157,120 @@ update_tools() {
   fi
 }
 case "${1:-}" in update | upgrade) update_tools; exit 0 ;; esac
+
+# `release doctor`: a checklist of what a release needs. Reads settings to check them and never prints a value:
+# only names, formats, and whether files exist. Exits 1 when something required is wrong.
+doctor_run() {
+  local problems=0 warnings=0 G="" R="" Y="" D="" B="" O=""
+  if [ -t 1 ]; then G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; B=$'\033[1m'; O=$'\033[0m'; fi
+
+  row()  { printf '%s%s %-*s %s%s%s\n' "$1" "$2" "$((24 - ${#1}))" "$3" "$D" "$4" "$O"; }   # indent, symbol, name, detail; detail column stays aligned
+  pass() { row "$1" "$G[✓]$O" "$2" "$3"; }
+  fail() { row "$1" "$R[✗]$O" "$2" "$3"; problems=$((problems + 1)); }
+  warn() { row "$1" "$Y[!]$O" "$2" "$3"; warnings=$((warnings + 1)); }
+  skip() { row "$1" "$D[–]$O" "$2" "$3"; }
+
+  # A "KEY=value" line from a file: surrounding spaces, quotes and carriage returns removed, as fastlane's loader does.
+  value_in() {
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1 | tr -d '\r' \
+      | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
+  }
+  loose() {                                                                       # file readable by group or others?
+    local m; m="$(file_mode "$1")"
+    [ -n "$m" ] && [ $((m % 100)) -ne 0 ]
+  }
+
+  # A store counts as set up when any of its keys has a value that is not the .env.example placeholder.
+  local envf="$TOOLS_DIR/fastlane/.env" examplef="$TOOLS_DIR/fastlane/.env.example"
+  group_is_set() {
+    local key v
+    for key in "$@"; do
+      v="$(value_in "$envf" "$key")"
+      if [ -n "$v" ] && [ "$v" != "$(value_in "$examplef" "$key")" ]; then return 0; fi
+    done
+    return 1
+  }
+  local uploads_set=0
+  group_is_set ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_PATH && uploads_set=1
+  group_is_set PLAY_JSON_KEY_PATH && uploads_set=1
+
+  echo "${B}release doctor${O}"
+  echo
+  echo "${B}Tools${O}"
+  if command -v git >/dev/null; then pass "  " git "$(command -v git)"; else fail "  " git "not installed"; fi
+  local fl="" d
+  fl="$(command -v flutter 2>/dev/null || true)"
+  if [ -z "$fl" ]; then
+    for d in "$HOME/fvm/default/bin" "$HOME/development/flutter/bin" "$HOME/flutter/bin"; do
+      [ -x "$d/flutter" ] && { fl="$d/flutter"; break; }
+    done
+  fi
+  if [ -n "$fl" ]; then pass "  " flutter "$fl"; else fail "  " flutter "not installed or not on PATH"; fi
+  if command -v fastlane >/dev/null; then pass "  " fastlane "$(command -v fastlane)"
+  elif [ "$uploads_set" = 1 ]; then fail "  " fastlane "not installed, but upload settings are filled in: brew install fastlane"
+  else skip "  " fastlane "not installed (only needed for uploads): brew install fastlane"; fi
+
+  echo
+  echo "${B}Android signing${O}"
+  local sf="${KEYSTORE_PROPERTIES:-$(saved_signing_path)}" k v
+  if [ -z "$sf" ]; then
+    fail "  " "signing file" "not set; run: release signing /path/to/keystore.properties"
+  elif [ ! -f "$sf" ]; then
+    fail "  " "signing file" "not found: $sf"
+  else
+    pass "  " "signing file" "$sf"
+    for k in KEY_ALIAS KEY_STORE_PASSWORD KEY_PASSWORD; do
+      if [ -n "$(value_in "$sf" "$k")" ]; then pass "    " "$k" "set"; else fail "    " "$k" "missing or empty"; fi
+    done
+    v="$(value_in "$sf" KEY_PATH)"
+    if [ -z "$v" ]; then fail "    " KEY_PATH "missing or empty"
+    elif [ ! -f "${v/#\~/$HOME}" ]; then fail "    " KEY_PATH "no keystore file at that path"
+    else
+      pass "    " KEY_PATH "keystore file found"
+      if loose "${v/#\~/$HOME}"; then warn "    " "keystore access" "readable by other users: chmod 600 on the keystore"; fi
+    fi
+    if loose "$sf"; then warn "    " "file access" "readable by other users: chmod 600 \"$sf\""; fi
+  fi
+
+  # Upload settings live in fastlane/.env. A store with nothing filled in is skipped; a half-filled one is checked key by key.
+  upload_group() {                                                                # label, then the keys
+    local label="$1" key ext
+    local key_id='^[A-Z0-9]{10}$' uuid='^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$'
+    shift
+    echo
+    echo "${B}$label uploads${O} ${D}(optional)${O}"
+    if ! group_is_set "$@"; then skip "  " "not set up" "fill in $envf"; return 0; fi
+    for key in "$@"; do
+      v="$(value_in "$envf" "$key")"; ext=""
+      if [ -z "$v" ]; then fail "  " "$key" "is empty"; continue; fi
+      case "$key" in
+        ASC_KEY_ID)         if [[ "$v" =~ $key_id ]]; then pass "  " "$key" "format ok"; else fail "  " "$key" "should be 10 capital letters or digits"; fi ;;
+        ASC_ISSUER_ID)      if [[ "$v" =~ $uuid ]]; then pass "  " "$key" "format ok"; else fail "  " "$key" "should be a UUID like 69a6de70-03db-47e3-e053-5b8c7c11a4d1"; fi ;;
+        ASC_KEY_PATH)       ext=p8 ;;
+        PLAY_JSON_KEY_PATH) ext=json ;;
+      esac
+      if [ -n "$ext" ]; then
+        if [ "${v##*.}" != "$ext" ]; then fail "  " "$key" "should be a path ending in .$ext"
+        elif [ ! -f "${v/#\~/$HOME}" ]; then fail "  " "$key" "no file at that path"
+        else
+          pass "  " "$key" ".$ext file found"
+          if loose "${v/#\~/$HOME}"; then warn "  " "$key access" "readable by other users: chmod 600 on that file"; fi
+        fi
+      fi
+    done
+  }
+  upload_group iOS ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_PATH
+  upload_group Play PLAY_JSON_KEY_PATH
+
+  echo
+  if [ "$problems" = 0 ]; then
+    echo "${G}No problems found.${O}$([ "$warnings" = 0 ] || echo " ${Y}$warnings warning(s).${O}")"
+  else
+    echo "${R}$problems problem(s) found.${O}$([ "$warnings" = 0 ] || echo " ${Y}$warnings warning(s).${O}")"
+  fi
+  [ "$problems" = 0 ]
+}
+case "${1:-}" in doctor) doctor_run && exit 0 || exit 1 ;; esac
 
 # The app is the git repo we are run from.
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "run this from inside an app repository"

@@ -113,3 +113,11 @@ release undo                 # remove the release commit, its tag and its build 
 `release undo` asks first, and refuses when the release commit is already pushed, when HEAD has moved past it, or when the tag is on the remote. It also refuses after a successful upload, because that build number is taken on the store; `--force` overrides that. It also works on a bump you left uncommitted with `--no-commit`.
 
 `release patch --upload --rollback-on-failure` does the same undo automatically, but only when no platform was uploaded.
+
+## Doctor
+
+```
+release doctor
+```
+
+A checklist like `flutter doctor`, working from any folder: `[✓]` is fine, `[✗]` is a problem you need to fix, `[!]` is a warning, `[–]` is an optional part you have not set up. It checks that git, flutter and fastlane are found; that the Android signing file has all four keys and a keystore that exists; and, for each store you started to fill in, that each upload setting has the right shape (key ID, issuer UUID, a `.p8` or `.json` file that exists). It warns when a secrets file is readable by other users. It never prints a value, only names and what is wrong. The installer runs it at the end, and it exits 1 when a required check fails.
