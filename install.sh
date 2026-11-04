@@ -42,12 +42,45 @@ case ":$PATH:" in
     fi ;;
 esac
 
+# What is still missing. Only names and file existence are checked; no value is read out or printed.
+env_file="$DIR/fastlane/.env"
+# The value of a key, as fastlane's .env loader sees it: no surrounding quotes, no trailing carriage return.
+env_value() {
+  sed -n "s/^$1=//p" "$env_file" 2>/dev/null | head -n 1 | tr -d '\r' \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\\(.*\\)'\$/\\1/" || true
+}
+env_has() { [ -n "$(env_value "$1")" ]; }                                       # key has a value
+env_file_exists() {                                                              # key names a file that exists
+  local v; v="$(env_value "$1")"
+  [ -n "$v" ] && [ -f "${v/#\~/$HOME}" ]
+}
+
+todo=""
+add() { todo="$todo$1"$'\n'; }
+
+have_flutter=0
+need flutter && have_flutter=1
+for d in "$HOME/fvm/default/bin" "$HOME/development/flutter/bin" "$HOME/flutter/bin"; do
+  [ -x "$d/flutter" ] && have_flutter=1
+done
+[ "$have_flutter" = 1 ] || add "flutter is not installed or not on PATH"
+need fastlane || add "fastlane is not installed (only needed for uploads): brew install fastlane"
+
+signing="$(sed -n 's/^KEYSTORE_PROPERTIES=//p' "$HOME/.config/release-tools/config" 2>/dev/null | head -n 1 || true)"
+[ -n "$signing" ] && [ -f "$signing" ] \
+  || add "Android signing: release signing /path/to/keystore.properties   (KEY_ALIAS, KEY_PATH, KEY_STORE_PASSWORD, KEY_PASSWORD)"
+
+if ! { env_has ASC_KEY_ID && env_has ASC_ISSUER_ID && env_file_exists ASC_KEY_PATH; }; then
+  add "iOS uploads (optional): set ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_PATH in $env_file"
+fi
+env_file_exists PLAY_JSON_KEY_PATH || add "Play uploads (optional): set PLAY_JSON_KEY_PATH in $env_file"
+
 say ""
-say "Installed. Missing pieces:"
-need flutter  || say "  - flutter is not on PATH"
-need fastlane || say "  - fastlane is not installed (only needed for --upload): brew install fastlane"
-say ""
-say "Next:"
-say "  1. Signing:  release signing /path/to/keystore.properties   (KEY_ALIAS, KEY_PATH, KEY_STORE_PASSWORD, KEY_PASSWORD)"
-say "  2. Uploads:  fill in $DIR/fastlane/.env (App Store Connect key, Play service account)"
-say "  3. In any Flutter app, run \`release\`"
+if [ -z "$todo" ]; then
+  say "Installed, and everything is set up. In any Flutter app, run \`release\`."
+else
+  say "Installed. Still to do:"
+  while IFS= read -r line; do [ -z "$line" ] || say "  - $line"; done <<<"$todo"
+  say ""
+  say "Then, in any Flutter app, run \`release\`."
+fi
