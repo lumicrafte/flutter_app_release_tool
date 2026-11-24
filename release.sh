@@ -25,6 +25,7 @@ USAGE
   release <bump> [options]         run without questions
   release clean [options]          delete old builds
   release undo [options]           take back the last release (commit, tag, build files)
+  release setup                    choose flavor, entry point and compile-time flags (saved in release.config)
   release signing <file>           remember the Android signing file
   release update                   install the latest release-tools (alias: upgrade)
   release doctor                   check the tools, signing file and upload settings
@@ -44,6 +45,11 @@ OPTIONS (builds and uploads)
   --tag                    tag the release commit as <app>/v<version> (default: no tag)
   --allow-dirty            allow unrelated uncommitted changes (only pubspec.yaml is committed)
   --rollback-on-failure    if every upload fails, undo the release (default: keep the build for a retry)
+  --flavor=NAME            build this flavor (overrides release.config)
+  --target=FILE            entry point, like flutter's --target
+  --define=KEY=VALUE       a compile-time value, like --dart-define (repeat for more)
+  --define-from-file=FILE  like --dart-define-from-file
+  --verbose                show fastlane's own output during uploads instead of the progress line
 
 CLEAN OPTIONS
   --keep N                 builds to keep, newest first (default: 3; the current version always stays)
@@ -67,7 +73,8 @@ FILES
   pubspec.yaml                         the version lives here (X.Y.Z+N); the app name comes from it
   android/app/build.gradle.kts         the Android package is read from applicationId
   release.config                       optional per-app overrides as KEY=value lines (read, not run):
-                                       APP_NAME, ANDROID_PACKAGE, TAG_PREFIX, KEYSTORE_PROPERTIES
+                                       APP_NAME, ANDROID_PACKAGE, TAG_PREFIX, KEYSTORE_PROPERTIES,
+                                       FLAVOR, TARGET, DART_DEFINE_FROM_FILE, DART_DEFINES (KEY=VALUE KEY=VALUE)
   ~/.config/release-tools/config       the signing file path, set once by `release signing`
   <install>/fastlane/.env              App Store Connect and Play credentials (see .env.example)
   build/releases/<version>/            the IPA and AAB of each release
@@ -382,6 +389,11 @@ CONFIG_SIGNING="$(config_value KEYSTORE_PROPERTIES)"
 : "${TAG_PREFIX:=$APP_NAME}"
 [ -n "$APP_NAME" ] || die "cannot read the app name from $PUBSPEC (set APP_NAME in release.config)"
 
+# Say which app this is before anything else: the name users see, then the package and branch.
+APP_LABEL="$(sed -nE 's|.*<string name="app_name">([^<]+)</string>.*|\1|p' android/app/src/main/res/values/strings.xml 2>/dev/null | head -n 1 || true)"
+: "${APP_LABEL:=$APP_NAME}"
+printf '\033[1m%s\033[0m  \033[2m·  %s  ·  %s\033[0m\n' "$APP_LABEL" "${ANDROID_PACKAGE:-$APP_NAME}" "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+
 # One signing key for every app. Order: environment, release.config, the remembered path.
 # Exported so each app's Gradle build reads the same file.
 KEYSTORE_PROPERTIES="${ENV_SIGNING:-${CONFIG_SIGNING:-$(saved_signing_path)}}"
@@ -619,10 +631,148 @@ if [ "${1:-}" = "clean" ]; then
   exit 0
 fi
 
+# ---- build setup: flavor, target, defines ----------------------------------------
+# What `flutter build` needs beyond --release. Found in the project, confirmed once by the user, then
+# remembered in release.config (FLAVOR, TARGET, DART_DEFINE_FROM_FILE, DART_DEFINES, BUILD_SETUP).
+# Nothing here is guessed silently: detected things are only offered, and the plan shows the final command.
+FLAVOR="$(config_value FLAVOR)"
+TARGET="$(config_value TARGET)"
+DEFINE_FILE="$(config_value DART_DEFINE_FROM_FILE)"
+DEFINES="$(config_value DART_DEFINES)"      # space separated KEY=VALUE, no spaces inside a value
+BUILD_SETUP="$(config_value BUILD_SETUP)"   # 1 once the questions were answered and saved
+
+detect_flavors() {
+  local f
+  for f in android/app/build.gradle.kts android/app/build.gradle; do
+    [ -f "$f" ] || continue
+    awk '
+      /productFlavors[ \t]*\{/ && !inside { inside = 1; depth = 1; next }
+      inside {
+        l = $0
+        if (depth == 1) {
+          if (match(l, /(create|register|maybeCreate)\("[^"]+"\)/)) { n = substr(l, RSTART, RLENGTH); gsub(/.*\("|"\)/, "", n); print n }
+          else if (match(l, /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\{/)) { n = l; gsub(/^[ \t]*|[ \t]*\{.*/, "", n); print n }
+        }
+        o = gsub(/\{/, "{", l); c = gsub(/\}/, "}", l); depth += o - c
+        if (depth <= 0) inside = 0
+      }' "$f"
+  done | sort -u
+}
+detect_targets() { local f; for f in lib/main_*.dart lib/main.*.dart; do [ -f "$f" ] && echo "$f"; done; return 0; }
+detect_define_files() {
+  local f
+  for f in env/*.json config/*.json .env*.json dart_define*.json *.defines.json; do [ -f "$f" ] && echo "$f"; done
+  return 0
+}
+# "bool ADS_ENABLED" lines for every compile-time value the code reads. Joined first so wrapped calls match.
+detect_define_keys() {
+  [ -d lib ] || return 0
+  find lib -name '*.dart' -exec cat {} + 2>/dev/null | tr '\n' ' ' \
+    | grep -oE "(bool|String|int)\.fromEnvironment\([[:space:]]*['\"][A-Za-z0-9_]+['\"]" \
+    | sed -E "s/^([A-Za-z]+)\.fromEnvironment\([[:space:]]*['\"]([A-Za-z0-9_]+)['\"]/\1 \2/" | sort -u || true
+}
+
+# Writes KEY=value into release.config; an empty value removes the line.
+config_set() {
+  local tmp; tmp="$(mktemp)"
+  if [ -f release.config ]; then grep -v "^$1=" release.config >"$tmp" || true; fi
+  [ -z "$2" ] || echo "$1=$2" >>"$tmp"
+  cat "$tmp" >release.config
+  rm -f "$tmp"
+}
+
+defines_get() { local p; for p in $DEFINES; do case "$p" in "$1="*) echo "${p#*=}"; return 0 ;; esac; done; return 0; }
+defines_set() {
+  local out="" p
+  for p in $DEFINES; do case "$p" in "$1="*) ;; *) out="$out $p" ;; esac; done
+  DEFINES="${out# } $1=$2"
+  DEFINES="${DEFINES# }"
+}
+
+# Index of $1 among the remaining arguments (0 when absent), for the default of a menu.
+index_of() { local want="$1" i=0 x; shift; for x in "$@"; do [ "$x" = "$want" ] && { echo "$i"; return 0; }; i=$((i + 1)); done; echo 0; }
+
+# Asks for whatever the project offers. Quiet when it offers nothing.
+build_setup() {
+  local flavors targets files keys line kind key idx
+  flavors="$(detect_flavors)"; targets="$(detect_targets)"; files="$(detect_define_files)"; keys="$(detect_define_keys)"
+  if [ -z "$flavors$targets$files$keys" ]; then
+    echo "Nothing to set up: no flavors, extra targets, define files or compile-time values found."
+    return 0
+  fi
+  echo
+  if [ -n "$flavors" ]; then
+    set --; for line in $flavors; do set -- "$@" "$line"; done
+    choose "Flavor" "$(index_of "$FLAVOR" "$@")" "$@"
+    shift "$CHOICE"; FLAVOR="$1"
+  fi
+  if [ -n "$targets" ]; then
+    set -- "lib/main.dart"; for line in $targets; do set -- "$@" "$line"; done
+    choose "Entry point (--target)" "$(index_of "${TARGET:-lib/main.dart}" "$@")" "$@"
+    shift "$CHOICE"; TARGET="$1"; [ "$TARGET" != "lib/main.dart" ] || TARGET=""
+  fi
+  if [ -n "$files" ]; then
+    set -- "none"; for line in $files; do set -- "$@" "$line"; done
+    choose "Define file (--dart-define-from-file)" "$(index_of "${DEFINE_FILE:-none}" "$@")" "$@"
+    shift "$CHOICE"; DEFINE_FILE="$1"; [ "$DEFINE_FILE" != "none" ] || DEFINE_FILE=""
+  fi
+  while read -r kind key <&3; do
+    [ -n "$key" ] || continue
+    if [ "$kind" = "bool" ]; then
+      idx=0; [ "$(defines_get "$key")" != "true" ] || idx=1
+      choose "$key (compile-time flag)" "$idx" "Off" "On"
+      defines_set "$key" "$([ "$CHOICE" = 1 ] && echo true || echo false)"
+    elif [ -z "$DEFINE_FILE" ] && [ -z "$(defines_get "$key")" ]; then
+      printf '\033[2m%s %s is read by the code: pass it with --define=%s=VALUE or a define file\033[0m\n' "$kind" "$key" "$key"
+    fi
+  done 3<<EOF2
+$keys
+EOF2
+  BUILD_SETUP=1
+  choose "Remember this in release.config?" 0 "Yes" "No, ask again next time"
+  if [ "$CHOICE" = 0 ]; then
+    config_set FLAVOR "$FLAVOR"; config_set TARGET "$TARGET"
+    config_set DART_DEFINE_FROM_FILE "$DEFINE_FILE"; config_set DART_DEFINES "$DEFINES"
+    config_set BUILD_SETUP 1
+    echo "saved to release.config (commit it to share the setup, or leave it local)"
+  else
+    BUILD_SETUP=""
+  fi
+}
+
+if [ "${1:-}" = "setup" ]; then
+  [ -t 0 ] || die "release setup asks questions and needs a terminal"
+  build_setup
+  exit 0
+fi
+
+# The options that go after `flutter build <kind> --release`, one per line.
+build_flags() {
+  local p
+  [ -z "$FLAVOR" ] || echo "--flavor=$FLAVOR"
+  [ -z "$TARGET" ] || echo "--target=$TARGET"
+  [ -z "$DEFINE_FILE" ] || echo "--dart-define-from-file=$DEFINE_FILE"
+  for p in $DEFINES; do echo "--dart-define=$p"; done
+}
+# The command as it is shown to the user. Define values other than flags and numbers are hidden.
+show_build() {
+  local out="flutter build $1 --release" o k v
+  for o in ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}; do
+    case "$o" in
+      --dart-define=*=*)
+        k="${o#--dart-define=}"; v="${k#*=}"; k="${k%%=*}"
+        echo "$v" | grep -qE '^(true|false|[0-9]+)$' || v='***'
+        o="--dart-define=$k=$v" ;;
+    esac
+    out="$out $o"
+  done
+  echo "$out"
+}
+
 # ---- args -------------------------------------------------------------------
 MODE=""
 DO_IOS=0; DO_ANDROID=0
-UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0; ROLLBACK_ON_FAIL=0
+UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0; ROLLBACK_ON_FAIL=0; VERBOSE=0
 SET_PLATFORM=0; SET_UPLOAD=0; SET_COMMIT=0; SET_TAG=0
 
 for arg in "$@"; do
@@ -636,6 +786,14 @@ for arg in "$@"; do
     --tag) TAG=1; SET_TAG=1 ;;
     --allow-dirty) DIRTY_OK=1 ;;
     --rollback-on-failure) ROLLBACK_ON_FAIL=1 ;;
+    --verbose) VERBOSE=1 ;;
+    --flavor=*) FLAVOR="${arg#--flavor=}" ;;
+    --target=*) TARGET="${arg#--target=}" ;;
+    --define-from-file=*) DEFINE_FILE="${arg#--define-from-file=}" ;;
+    --define=*)
+      pair="${arg#--define=}"
+      echo "$pair" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$' || die "--define needs KEY=VALUE without spaces: $arg"
+      defines_set "${pair%%=*}" "${pair#*=}" ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $arg" >&2; usage 1 ;;
   esac
@@ -666,6 +824,7 @@ if [ -z "$MODE" ]; then
       2) DO_ANDROID=1; SET_PLATFORM=1 ;;
     esac
   fi
+  if [ "$MODE" != "upload" ] && [ "$BUILD_SETUP" != 1 ]; then build_setup; fi
   if [ "$SET_UPLOAD" = 0 ]; then
     choose "Upload to the stores after building?" 1 "Yes (TestFlight / Play $(grep -s '^PLAY_TRACK=' "$TOOLS_DIR/fastlane/.env" | cut -d= -f2- | grep . || echo internal))" "No, build only"
     [ "$CHOICE" = 0 ] && UPLOAD=1
@@ -678,7 +837,7 @@ if [ -z "$MODE" ]; then
     choose "Tag the release commit?" 0 "No" "Yes ($TAG_PREFIX/v$(next_version "$MODE"))"
     [ "$CHOICE" = 1 ] && TAG=1
   fi
-  if [ "$MODE" != "upload" ] && [ -n "$(git status --porcelain)" ] && [ "$DIRTY_OK" = 0 ]; then
+  if [ "$MODE" != "upload" ] && [ -n "$(git status --porcelain -- . ':!release.config')" ] && [ "$DIRTY_OK" = 0 ]; then
     choose "Working tree has uncommitted changes. Continue anyway?" 1 "No, stop" "Yes, release with them left out"
     [ "$CHOICE" = 0 ] && exit 1
     DIRTY_OK=1
@@ -712,7 +871,7 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$MODE" != "upload" ]; then
   git diff --quiet -- "$PUBSPEC" && git diff --cached --quiet -- "$PUBSPEC" \
     || die "$PUBSPEC has uncommitted changes"
-  if [ "$DIRTY_OK" = 0 ] && [ -n "$(git status --porcelain)" ]; then
+  if [ "$DIRTY_OK" = 0 ] && [ -n "$(git status --porcelain -- . ':!release.config')" ]; then
     die "working tree is not clean (commit or stash, or pass --allow-dirty)"
   fi
 fi
@@ -720,6 +879,21 @@ if [ "$TAG" = 1 ] && git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null;
   die "tag $TAG_NAME already exists"
 fi
 [ "$MODE" = "upload" ] || command -v flutter >/dev/null || die "flutter not on PATH"
+BUILD_OPTS=()
+if [ "$MODE" != "upload" ]; then
+  FLAVORS_FOUND="$(detect_flavors)"
+  if [ -n "$FLAVORS_FOUND" ]; then
+    [ -n "$FLAVOR" ] || die "this app has flavors ($(echo $FLAVORS_FOUND | tr ' ' ',')): pass --flavor=NAME or run: release setup"
+    echo "$FLAVORS_FOUND" | grep -qx "$FLAVOR" || die "unknown flavor '$FLAVOR' (found: $(echo $FLAVORS_FOUND | tr ' ' ','))"
+  elif [ -n "$FLAVOR" ]; then
+    echo "warning: FLAVOR=$FLAVOR is set but no productFlavors were found in android/app/build.gradle*" >&2
+  fi
+  [ -z "$TARGET" ] || [ -f "$TARGET" ] || die "target not found: $TARGET"
+  [ -z "$DEFINE_FILE" ] || [ -f "$DEFINE_FILE" ] || die "define file not found: $DEFINE_FILE"
+  while IFS= read -r line; do [ -z "$line" ] || BUILD_OPTS+=("$line"); done <<EOF3
+$(build_flags)
+EOF3
+fi
 if [ "$DO_ANDROID" = 1 ] && [ "$MODE" != "upload" ]; then
   if [ ! -f "${KEYSTORE_PROPERTIES:-}" ]; then
     if [ "$DRY" = 1 ]; then
@@ -776,6 +950,10 @@ PLATFORMS=""
 [ "$DO_IOS" = 1 ] && PLATFORMS="$PLATFORMS ios"
 [ "$DO_ANDROID" = 1 ] && PLATFORMS="$PLATFORMS android"
 echo "platforms:$PLATFORMS | upload: $UPLOAD | commit: $COMMIT | tag: $TAG | artifacts: $OUT_DIR"
+if [ "$MODE" != "upload" ]; then
+  if [ "$DO_IOS" = 1 ]; then echo "  $(show_build ipa)"; fi
+  if [ "$DO_ANDROID" = 1 ]; then echo "  $(show_build appbundle)"; fi
+fi
 
 if [ "$DRY" = 1 ]; then
   [ -z "$IPA" ] || echo "would upload: $IPA"
@@ -813,11 +991,19 @@ if [ "$MODE" != "upload" ]; then
 
   mkdir -p "$OUT_DIR"
 
+  # Remember how this version was built, so the other platform later gets the same options.
+  OPTS_FILE="$OUT_DIR/build-options.txt"
+  OPTS_NOW="$(show_build x | sed -e 's/^flutter build x --release//' -e 's/^ //')"
+  if [ -f "$OPTS_FILE" ] && [ "$(cat "$OPTS_FILE")" != "$OPTS_NOW" ]; then
+    echo "warning: $CURRENT was built before with different options: ${OPTS_FILE##*/} says '$(cat "$OPTS_FILE")', now '$OPTS_NOW'" >&2
+  fi
+  printf '%s\n' "$OPTS_NOW" >"$OPTS_FILE"
+
   # ---- build ------------------------------------------------------------------
 
   if [ "$DO_IOS" = 1 ]; then
     step "Build iOS (ipa)"
-    flutter build ipa --release
+    flutter build ipa --release ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}
     IPA="$(ls -t build/ios/ipa/*.ipa 2>/dev/null | head -n 1 || true)"
     [ -n "$IPA" ] || die "no .ipa produced in build/ios/ipa"
     cp "$IPA" "$OUT_DIR/"
@@ -826,9 +1012,13 @@ if [ "$MODE" != "upload" ]; then
 
   if [ "$DO_ANDROID" = 1 ]; then
     step "Build Android (aab)"
-    flutter build appbundle --release
-    AAB="build/app/outputs/bundle/release/app-release.aab"
-    [ -f "$AAB" ] || die "no .aab produced at $AAB"
+    flutter build appbundle --release ${BUILD_OPTS[@]+"${BUILD_OPTS[@]}"}
+    if [ -n "$FLAVOR" ]; then
+      AAB="$(ls -t build/app/outputs/bundle/*/*.aab 2>/dev/null | head -n 1 || true)"
+    else
+      AAB="build/app/outputs/bundle/release/app-release.aab"
+    fi
+    [ -f "$AAB" ] || die "no .aab produced under build/app/outputs/bundle"
     cp "$AAB" "$OUT_DIR/$APP_NAME-$NEXT.aab"
     AAB="$ROOT/$OUT_DIR/$APP_NAME-$NEXT.aab"
   fi
@@ -855,56 +1045,6 @@ run_lane() {
   (cd "$TOOLS_DIR" && FASTLANE_SKIP_UPDATE_CHECK=1 FASTLANE_HIDE_CHANGELOG=1 FASTLANE_SKIP_DOCS=1 fastlane "$@")
 }
 
-UPLOAD_FAILED=0; UPLOADED=0; FAILED=""
-if [ "$UPLOAD" = 1 ]; then
-  if [ -n "$IPA" ]; then
-    if [ -f "$(marker_path "$NEXT" ios)" ]; then
-      echo "iOS $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" ios) to upload again)"
-    else
-      step "Upload iOS to TestFlight"
-      if IPA_PATH="$IPA" upload_with_progress iOS "$IPA" ios_upload; then mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
-      else UPLOAD_FAILED=1; FAILED="$FAILED ios"; fi
-    fi
-  fi
-  if [ -n "$AAB" ]; then
-    if [ -f "$(marker_path "$NEXT" android)" ]; then
-      echo "Android $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" android) to upload again)"
-    else
-      step "Upload Android to Play"
-      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" upload_with_progress Android "$AAB" android_upload; then mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
-      else UPLOAD_FAILED=1; FAILED="$FAILED android"; fi
-    fi
-  fi
-fi
-
-if [ "$UPLOAD_FAILED" = 1 ]; then
-  # A failed upload is usually a store-side problem (a console declaration, an agreement), and the build is
-  # fine. So the build, commit and tag are kept by default. --rollback-on-failure undoes them, but only when
-  # nothing reached a store: an uploaded build number is taken and must not be reused.
-  taken=0; [ -z "$(uploaded_platforms "$NEXT")" ] || taken=1
-  if [ "$ROLLBACK_ON_FAIL" = 1 ] && [ "$taken" = 0 ] && [ "$NEXT" != "$CURRENT" ] \
-     && { [ -z "$RELEASE_COMMIT" ] || [ "$(git rev-parse HEAD)" = "$RELEASE_COMMIT" ]; }; then
-    step "Upload failed: undoing release $NEXT"
-    if [ -n "$RELEASE_COMMIT" ]; then
-      revert_release commit "$NEXT" "$([ "$TAG_MADE" = 1 ] && echo "$TAG_NAME")" "$CURRENT"
-    else
-      revert_release worktree "$NEXT" "" "$CURRENT"
-    fi
-    exit 1
-  fi
-  echo >&2
-  echo "Upload failed for:$FAILED. The build is fine and is kept in $OUT_DIR." >&2
-  echo "Fix the problem on the store side, then retry with:" >&2
-  for p in $FAILED; do echo "  release upload --$p" >&2; done
-  echo "To take the release back instead: release undo" >&2
-fi
-
-# ---- summary ----------------------------------------------------------------
-step "Done: $NEXT"
-[ -n "$IPA" ] && echo "ipa: $IPA"
-[ -n "$AAB" ] && echo "aab: $AAB"
-[ "$COMMIT" = 1 ] && echo "push when ready: git push --follow-tags"
-exit "$UPLOAD_FAILED"
 # Bytes this Mac has sent on an interface so far (macOS netstat). Empty when it cannot be read.
 net_sent_bytes() { netstat -ib -I "$1" 2>/dev/null | awk '$3 ~ /^<Link/ { print $(NF-1); exit }'; }
 file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
@@ -961,3 +1101,53 @@ upload_with_progress() {
   return "$rc"
 }
 
+UPLOAD_FAILED=0; UPLOADED=0; FAILED=""
+if [ "$UPLOAD" = 1 ]; then
+  if [ -n "$IPA" ]; then
+    if [ -f "$(marker_path "$NEXT" ios)" ]; then
+      echo "iOS $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" ios) to upload again)"
+    else
+      step "Upload iOS to TestFlight"
+      if IPA_PATH="$IPA" upload_with_progress iOS "$IPA" ios_upload; then mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
+      else UPLOAD_FAILED=1; FAILED="$FAILED ios"; fi
+    fi
+  fi
+  if [ -n "$AAB" ]; then
+    if [ -f "$(marker_path "$NEXT" android)" ]; then
+      echo "Android $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" android) to upload again)"
+    else
+      step "Upload Android to Play"
+      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" upload_with_progress Android "$AAB" android_upload; then mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
+      else UPLOAD_FAILED=1; FAILED="$FAILED android"; fi
+    fi
+  fi
+fi
+
+if [ "$UPLOAD_FAILED" = 1 ]; then
+  # A failed upload is usually a store-side problem (a console declaration, an agreement), and the build is
+  # fine. So the build, commit and tag are kept by default. --rollback-on-failure undoes them, but only when
+  # nothing reached a store: an uploaded build number is taken and must not be reused.
+  taken=0; [ -z "$(uploaded_platforms "$NEXT")" ] || taken=1
+  if [ "$ROLLBACK_ON_FAIL" = 1 ] && [ "$taken" = 0 ] && [ "$NEXT" != "$CURRENT" ] \
+     && { [ -z "$RELEASE_COMMIT" ] || [ "$(git rev-parse HEAD)" = "$RELEASE_COMMIT" ]; }; then
+    step "Upload failed: undoing release $NEXT"
+    if [ -n "$RELEASE_COMMIT" ]; then
+      revert_release commit "$NEXT" "$([ "$TAG_MADE" = 1 ] && echo "$TAG_NAME")" "$CURRENT"
+    else
+      revert_release worktree "$NEXT" "" "$CURRENT"
+    fi
+    exit 1
+  fi
+  echo >&2
+  echo "Upload failed for:$FAILED. The build is fine and is kept in $OUT_DIR." >&2
+  echo "Fix the problem on the store side, then retry with:" >&2
+  for p in $FAILED; do echo "  release upload --$p" >&2; done
+  echo "To take the release back instead: release undo" >&2
+fi
+
+# ---- summary ----------------------------------------------------------------
+step "Done: $NEXT"
+[ -n "$IPA" ] && echo "ipa: $IPA"
+[ -n "$AAB" ] && echo "aab: $AAB"
+[ "$COMMIT" = 1 ] && echo "push when ready: git push --follow-tags"
+exit "$UPLOAD_FAILED"

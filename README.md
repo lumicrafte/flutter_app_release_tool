@@ -70,6 +70,28 @@ Bump types: `patch`, `minor`, `major`, `build` (build number only), `upload` (no
 
 The version bump is committed as `release: <app> <version>`; pass `--no-commit` to leave it uncommitted. Tagging is optional: `--tag` also tags the commit as `<app>/v<version>` (the app is the last part of the Android package, so several apps in one repo never collide). Other flags: `--ios`, `--android`, `--upload`, `--dry-run`, `--allow-dirty`.
 
+## Flavors, entry points and compile-time values
+
+If the app has Android `productFlavors`, extra `lib/main_*.dart` entry points, define files (`env/*.json`) or
+reads `bool.fromEnvironment('KEY')` values, `release` asks about them once and offers to remember the answers
+in `release.config`:
+
+```
+FLAVOR=prod
+TARGET=lib/main_prod.dart
+DART_DEFINE_FROM_FILE=env/prod.json
+DART_DEFINES=ADS_ENABLED=true BACKGROUND_SPLIT=false
+```
+
+- `release setup` asks again. Flags override for one run: `--flavor=NAME`, `--target=FILE`,
+  `--define=KEY=VALUE` (repeat), `--define-from-file=FILE`.
+- The plan and `--dry-run` print the exact `flutter build` commands. Define values other than true/false and
+  numbers are shown as `***`, and the contents of a define file are never printed.
+- Runs without a terminal never ask. If the app has flavors and none is set, they stop with a message.
+- The options are saved in `build/releases/<version>/build-options.txt`; building the other platform of the
+  same version with different options prints a warning.
+- `release.config` does not count as an uncommitted change. Commit it to share the setup, or leave it local.
+
 ## Clean up old builds
 
 Every release leaves its IPA and AAB in `build/releases/<version>/`, about 130 MB each. Remove the old ones:
