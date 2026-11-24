@@ -862,7 +862,7 @@ if [ "$UPLOAD" = 1 ]; then
       echo "iOS $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" ios) to upload again)"
     else
       step "Upload iOS to TestFlight"
-      if IPA_PATH="$IPA" run_lane ios_upload; then mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
+      if IPA_PATH="$IPA" upload_with_progress iOS "$IPA" ios_upload; then mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
       else UPLOAD_FAILED=1; FAILED="$FAILED ios"; fi
     fi
   fi
@@ -871,7 +871,7 @@ if [ "$UPLOAD" = 1 ]; then
       echo "Android $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" android) to upload again)"
     else
       step "Upload Android to Play"
-      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" run_lane android_upload; then mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
+      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" upload_with_progress Android "$AAB" android_upload; then mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
       else UPLOAD_FAILED=1; FAILED="$FAILED android"; fi
     fi
   fi
@@ -905,3 +905,59 @@ step "Done: $NEXT"
 [ -n "$AAB" ] && echo "aab: $AAB"
 [ "$COMMIT" = 1 ] && echo "push when ready: git push --follow-tags"
 exit "$UPLOAD_FAILED"
+# Bytes this Mac has sent on an interface so far (macOS netstat). Empty when it cannot be read.
+net_sent_bytes() { netstat -ib -I "$1" 2>/dev/null | awk '$3 ~ /^<Link/ { print $(NF-1); exit }'; }
+file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
+clock() { printf '%d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+# Runs an upload lane and shows an estimated progress line. Neither store reports progress to fastlane, so the
+# estimate is the bytes this Mac has sent on its default network interface since the upload began, against the
+# file size: it can run a little high (other traffic and protocol overhead count too), so it stops at 99% until
+# fastlane finishes. fastlane's own output goes to a log that is shown only when the upload fails.
+# Usage: [ENV=...] upload_with_progress "Android" /path/file.aab lane
+upload_with_progress() {
+  local label="$1" file="$2" lane="$3"
+  if [ "$VERBOSE" = 1 ] || [ ! -t 1 ]; then run_lane "$lane"; return; fi
+
+  local log pid rc=0 iface total start now elapsed sent0 now_sent sent prev=0 rate=0 pct fill bar="" i
+  log="$(mktemp "${TMPDIR:-/tmp}/release-tools-$lane.XXXXXX")"
+  total="$(file_size "$file")"
+  iface="$(route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }' || true)"
+  sent0=""; [ -z "$iface" ] || sent0="$(net_sent_bytes "$iface")"
+
+  run_lane "$lane" >"$log" 2>&1 &
+  pid=$!
+  trap 'kill "$pid" 2>/dev/null; rm -f "$log"; printf "\r\033[2K"; echo "  interrupted; the build is kept (retry the upload with: release upload)"; exit 130' INT TERM
+  start="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null; do
+    now="$(date +%s)"; elapsed=$((now - start))
+    now_sent=""; [ -z "$sent0" ] || now_sent="$(net_sent_bytes "$iface")"
+    if [ -n "$now_sent" ] && [ "$total" -gt 0 ]; then
+      sent=$((now_sent - sent0)); [ "$sent" -ge 0 ] || sent=0
+      pct=$((sent * 100 / total)); [ "$pct" -le 99 ] || pct=99
+      rate=$(( (rate * 2 + (sent - prev)) / 3 )); [ "$rate" -ge 0 ] || rate=0; prev=$sent        # smoothed bytes per second
+      fill=$((pct * 20 / 100)); bar=""
+      for ((i = 0; i < 20; i++)); do if [ "$i" -lt "$fill" ]; then bar="${bar}▓"; else bar="${bar}░"; fi; done
+      printf '\r\033[2K  Uploading %s  %s ~%d%%  %d of %d MB  %d.%d MB/s  %s' "$label" "$bar" "$pct" \
+        "$((sent / 1048576 > total / 1048576 ? total / 1048576 : sent / 1048576))" "$((total / 1048576))" \
+        "$((rate / 1048576))" "$((rate * 10 / 1048576 % 10))" "$(clock "$elapsed")"
+    else
+      printf '\r\033[2K  Uploading %s…  %s' "$label" "$(clock "$elapsed")"
+    fi
+    sleep 1
+  done
+  wait "$pid" && rc=0 || rc=$?
+  trap - INT TERM
+  elapsed=$(( $(date +%s) - start ))
+  printf '\r\033[2K'
+  if [ "$rc" = 0 ]; then
+    echo "  ✔ $label uploaded in $(clock "$elapsed")"
+    rm -f "$log"
+  else
+    echo "  ✗ $label upload failed after $(clock "$elapsed")" >&2
+    tail -n 40 "$log" >&2
+    echo "  (full fastlane log: $log)" >&2
+  fi
+  return "$rc"
+}
+

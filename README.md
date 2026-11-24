@@ -121,3 +121,13 @@ release doctor
 ```
 
 A checklist like `flutter doctor`, working from any folder: `[✓]` is fine, `[✗]` is a problem you need to fix, `[!]` is a warning, `[–]` is an optional part you have not set up. It checks that git, flutter and fastlane are found; that the Android signing file has all four keys and a keystore that exists, and that the passwords really open it (it signs a throwaway file with the JDK's `jarsigner`, handing the passwords over through the environment, never on a command line, and reports which of the store password, key password or alias is wrong; it reads the signing file the way Gradle does, so quotes, a trailing space or a backslash in a value are flagged because Gradle keeps them literally; with several JDKs installed it passes if any accepts the passwords; skipped when no JDK or `zip` is found); and, for each store you started to fill in, that each upload setting has the right shape (key ID, issuer UUID, a `.p8` or `.json` file that exists). It warns when a secrets file is readable by other users. It never prints a value, only names and what is wrong. The installer runs it at the end, and it exits 1 when a required check fails. `release` itself runs the same password check before an Android build, so a wrong password stops it in a second instead of after the build.
+
+## Upload progress
+
+Neither TestFlight nor Google Play reports progress to fastlane, so while an upload runs `release` shows an estimate:
+
+```
+  Uploading Android  ▓▓▓▓▓▓▓▓░░░░░░░░░░░░ ~40%  40 of 93 MB  11.1 MB/s  0:01
+```
+
+It compares the bytes your Mac has sent on its default network interface since the upload began with the file size. Other network traffic counts too and protocol overhead makes it run slightly high, so it is an estimate and stops at 99% until fastlane reports the upload finished. If the interface cannot be read it falls back to an elapsed-time line. fastlane's own output is kept in a log that is printed, with its path, only when the upload fails. `--verbose` shows fastlane's output live instead, and a run that is not on a terminal (CI, a pipe) prints plain output. Ctrl-C stops the upload and keeps the build for `release upload`. This needs macOS (`netstat`, `route`).
