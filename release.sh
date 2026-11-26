@@ -49,6 +49,7 @@ OPTIONS (builds and uploads)
   --target=FILE            entry point, like flutter's --target
   --define=KEY=VALUE       a compile-time value, like --dart-define (repeat for more)
   --define-from-file=FILE  like --dart-define-from-file
+  --reupload               upload again even if this version was marked as uploaded (it never showed up)
   --verbose                show fastlane's own output during uploads instead of the progress line
 
 CLEAN OPTIONS
@@ -493,6 +494,7 @@ choose() {
 # in .git, which neither `flutter clean` nor `release clean` touches, and is never committed.
 GIT_DIR_ABS="$(git rev-parse --absolute-git-dir)"
 marker_path() { echo "$GIT_DIR_ABS/release-tools/uploaded-$1-$2"; }       # version, platform
+marker_date() { stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$(marker_path "$1" "$2")" 2>/dev/null || echo "earlier"; }
 mark_uploaded() { mkdir -p "$GIT_DIR_ABS/release-tools" && : > "$(marker_path "$1" "$2")"; }
 uploaded_platforms() {                                                     # version -> "ios android"
   local f out=""
@@ -772,7 +774,7 @@ show_build() {
 # ---- args -------------------------------------------------------------------
 MODE=""
 DO_IOS=0; DO_ANDROID=0
-UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0; ROLLBACK_ON_FAIL=0; VERBOSE=0
+REUPLOAD=0; UPLOAD=0; DRY=0; COMMIT=1; TAG=0; DIRTY_OK=0; ROLLBACK_ON_FAIL=0; VERBOSE=0
 SET_PLATFORM=0; SET_UPLOAD=0; SET_COMMIT=0; SET_TAG=0
 
 for arg in "$@"; do
@@ -787,6 +789,7 @@ for arg in "$@"; do
     --allow-dirty) DIRTY_OK=1 ;;
     --rollback-on-failure) ROLLBACK_ON_FAIL=1 ;;
     --verbose) VERBOSE=1 ;;
+    --reupload) REUPLOAD=1 ;;
     --flavor=*) FLAVOR="${arg#--flavor=}" ;;
     --target=*) TARGET="${arg#--target=}" ;;
     --define-from-file=*) DEFINE_FILE="${arg#--define-from-file=}" ;;
@@ -936,13 +939,33 @@ if [ "$MODE" = "upload" ]; then
       AAB=""
     fi
   fi
+  # A marker means fastlane reported success. The build can still go missing (Apple drops a binary that
+  # fails processing, a Play upload lands in an unexpected track), so offer to send it again. A store that
+  # did receive it rejects the same build number, so a second upload cannot create a duplicate.
   ALREADY=""
-  if [ -n "$IPA" ] && [ -f "$(marker_path "$NEXT" ios)" ]; then ALREADY="$ALREADY ios"; IPA=""; fi
-  if [ -n "$AAB" ] && [ -f "$(marker_path "$NEXT" android)" ]; then ALREADY="$ALREADY android"; AAB=""; fi
+  for p in ios android; do
+    if [ "$p" = ios ]; then have="$IPA"; label=iOS; store=TestFlight; else have="$AAB"; label=Android; store=Play; fi
+    [ -n "$have" ] && [ -f "$(marker_path "$NEXT" "$p")" ] && [ "$REUPLOAD" = 0 ] || continue
+    again=0
+    if [ -t 0 ] && [ "$DRY" = 0 ]; then
+      choose "$label $NEXT was uploaded on $(marker_date "$NEXT" "$p"). Upload it again?" 0 \
+        "No, skip $label" \
+        "Yes, it never showed up in $store"
+      again="$CHOICE"
+    fi
+    if [ "$again" = 0 ]; then
+      ALREADY="$ALREADY $p"
+      if [ "$p" = ios ]; then IPA=""; else AAB=""; fi
+    fi
+  done
   if [ -z "$IPA$AAB" ] && [ -n "$ALREADY" ]; then
-    echo "already uploaded:$ALREADY (to upload again, delete $GIT_DIR_ABS/release-tools/uploaded-$NEXT-*)"
+    echo "already uploaded:$ALREADY"
+    echo "if it never showed up in the store, send it again with:"
+    for p in $ALREADY; do echo "  release upload --$p --reupload"; done
     exit 0
   fi
+  for p in $ALREADY; do echo "skipping $p: already uploaded (to send it again: release upload --$p --reupload)"; done
+  REUPLOAD=1   # whatever is left was chosen on purpose
   [ -n "$IPA$AAB" ] || die "nothing to upload in $OUT_DIR for $CURRENT"
 fi
 
@@ -1104,20 +1127,26 @@ upload_with_progress() {
 UPLOAD_FAILED=0; UPLOADED=0; FAILED=""
 if [ "$UPLOAD" = 1 ]; then
   if [ -n "$IPA" ]; then
-    if [ -f "$(marker_path "$NEXT" ios)" ]; then
-      echo "iOS $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" ios) to upload again)"
+    if [ "$REUPLOAD" = 0 ] && [ -f "$(marker_path "$NEXT" ios)" ]; then
+      echo "iOS $NEXT was already uploaded; skipping (to send it again: release upload --ios --reupload)"
     else
       step "Upload iOS to TestFlight"
-      if IPA_PATH="$IPA" upload_with_progress iOS "$IPA" ios_upload; then mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
+      if IPA_PATH="$IPA" upload_with_progress iOS "$IPA" ios_upload; then
+        mark_uploaded "$NEXT" ios; UPLOADED=$((UPLOADED + 1))
+        echo "  TestFlight lists it after Apple processes it (often 5-30 min). If it never shows, check the"
+        echo "  App Store Connect email for an invalid-binary notice, then: release upload --ios --reupload"
       else UPLOAD_FAILED=1; FAILED="$FAILED ios"; fi
     fi
   fi
   if [ -n "$AAB" ]; then
-    if [ -f "$(marker_path "$NEXT" android)" ]; then
-      echo "Android $NEXT was already uploaded; skipping (delete $(marker_path "$NEXT" android) to upload again)"
+    if [ "$REUPLOAD" = 0 ] && [ -f "$(marker_path "$NEXT" android)" ]; then
+      echo "Android $NEXT was already uploaded; skipping (to send it again: release upload --android --reupload)"
     else
       step "Upload Android to Play"
-      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" upload_with_progress Android "$AAB" android_upload; then mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
+      if AAB_PATH="$AAB" ANDROID_PACKAGE="$ANDROID_PACKAGE" upload_with_progress Android "$AAB" android_upload; then
+        mark_uploaded "$NEXT" android; UPLOADED=$((UPLOADED + 1))
+        echo "  Play Console lists it in the $(grep -s '^PLAY_TRACK=' "$TOOLS_DIR/fastlane/.env" | cut -d= -f2- | grep . || echo internal) track. If it is not there:"
+        echo "  release upload --android --reupload"
       else UPLOAD_FAILED=1; FAILED="$FAILED android"; fi
     fi
   fi

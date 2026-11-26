@@ -124,7 +124,7 @@ A failed upload is usually a store-side problem (a declaration missing in Play C
 release upload --android     # after fixing the problem in the store
 ```
 
-Each successful upload leaves a marker in `.git/release-tools/` (`uploaded-<version>-ios` or `-android`). It lives in `.git` so `flutter clean` and `release clean` cannot erase it, and it is never committed. `release upload` skips a platform that already has a marker, so a retry never uploads twice; delete the marker file to upload again.
+Each successful upload leaves a marker in `.git/release-tools/` (`uploaded-<version>-ios` or `-android`). It lives in `.git` so `flutter clean` and `release clean` cannot erase it, and it is never committed. `release upload` skips a platform that already has a marker, so a retry never uploads twice. Sometimes fastlane reports success but the build never shows up (Apple drops a binary that fails processing). Then `release upload` asks whether to send it again, or pass `--reupload` (for example `release upload --ios --reupload`). A store that did receive the build rejects the same build number, so this cannot create a duplicate.
 
 To take a release back instead:
 
